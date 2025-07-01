@@ -1,0 +1,292 @@
+from params import DEVICE
+
+import os
+import math
+import matplotlib.pyplot as plt 
+
+import torch
+import torch.nn as nn
+
+
+
+class VRNN(nn.Module):
+
+    def __init__(self, x_dim, z_dim, std_Y, h_dim, n_layers, verbose=0):
+        super().__init__()
+
+        self.x_dim = x_dim
+        self.z_dim = z_dim
+
+        self.h_dim = h_dim
+        self.n_layers = n_layers
+
+
+        # known outcome dist Y_t | θ_t ~ p_Y(·) = N(θ_t, σ_Y^2)
+        self.std_Y = std_Y
+
+        # feature model
+        self.phi_x = nn.Identity()  # 원래는 x_dim -> h_dim
+        self.phi_z = nn.Identity()  # 원래는 z_dim -> h_dim
+
+
+        # ------ Inference model ------
+
+        # encoder z_t | x_t, h_t-1 = x_<=t, z_<t ~ q_enc(·) = N( μ_enc(x_t, h_t), σ_enc(x_t, h_t) )
+        # self.enc = nn.Linear(h_dim + x_dim, h_dim) # 원래는 x_dim -> h_dim
+        self.enc = nn.Sequential(
+            nn.Linear(h_dim + x_dim, h_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(h_dim, h_dim)
+        )
+        self.enc_mean = nn.Linear(h_dim, z_dim)
+        self.enc_std = nn.Sequential(
+            nn.Linear(h_dim, z_dim),
+            nn.Softplus())
+
+
+        # ------ Generation model ------
+
+        # prior z_t | h_t-1 = z_<t, x_<t () ~ p_pr(·) = N( μ_pr(h_t), σ_pr(h_t) )
+        # self.pr = nn.Linear(h_dim, h_dim)
+        self.pr = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(h_dim, h_dim)
+        )
+        self.pr_mean = nn.Linear(h_dim, z_dim)
+        self.pr_std = nn.Sequential(
+            nn.Linear(h_dim, z_dim),
+            nn.Softplus())
+        
+        # decoder x_t | z_t, h_t-1 = z_<=t, x<t ~ p_dec(·) = N( μ_dec(h_t), σ_dec(h_t) )
+        # self.dec = nn.Linear(h_dim + z_dim, h_dim) # 원래는 z_dim -> h_dim
+        self.dec = nn.Sequential(
+            nn.Linear(h_dim + z_dim, h_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(h_dim, h_dim)
+        )
+        self.dec_mean = nn.Linear(h_dim, x_dim)
+        self.dec_std = nn.Sequential(
+            nn.Linear(h_dim, x_dim),
+            nn.Softplus())
+        
+
+        # ------ autoregressive model ------
+
+        # Reccurence h_t = GRU( x_t, z_t, h_t-1 )
+        # input, output : R^(L, B, x_dim + z_dim)
+        # hidden : R^(n_layers, B, h_dim)
+        self.rnn = nn.GRU(x_dim + z_dim, h_dim, n_layers)
+
+        for weight in self.parameters():    weight.data.normal_(0, 1e-1)
+
+        self.verbose = verbose
+
+
+
+    # encoder μ_enc( enc(Y_t, h_t) ), σ_enc( enc(Y_t, h_t) )
+    def q_enc(self, x_t, h):
+        
+        phi_x_t = self.phi_x(x_t)
+        enc_t = self.enc(torch.cat([phi_x_t, h[-1]], 1))
+        q_mean_t = self.enc_mean(enc_t)
+        # q_std_t = self.enc_std(enc_t) 
+        q_std_t = torch.ones_like(q_mean_t) * 0.1
+
+        return q_mean_t, q_std_t
+    
+    # prior μ_pr( pr(h_t) ), σ_pr( pr(h_t) )
+    def p_pr(self, h):
+
+        pr_t = self.pr(h[-1])
+        pr_mean_t = self.pr_mean(pr_t)
+        # pr_std_t = self.pr_std(pr_t)
+        pr_std_t = torch.ones_like(pr_mean_t) * 0.1
+        
+        return pr_mean_t, pr_std_t
+ 
+    # decoder μ_dec( dec(z_t, h_t) ), σ_dec( dec(z_t, h_t) )
+    def p_dec(self, z_t, h):
+
+        phi_z_t = self.phi_z(z_t)
+        dec_t = self.dec(torch.cat([phi_z_t, h[-1]], 1))
+        p_mean_t = self.dec_mean(dec_t)
+        # p_std_t = self.dec_std(dec_t)
+        p_std_t = torch.ones_like(p_mean_t) * 0.1
+        
+        return p_mean_t, p_std_t
+
+    # recurrence h_t+1 = GRU(θ_t, h_t)
+    def f_rec(self, x_t, z_t, h):
+
+        phi_x_t = self.phi_x(x_t)
+        phi_z_t = self.phi_z(z_t)
+        # input : (B, x_dim + z_dim) -> (1, B, x_dim + z_dim)
+        _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0), h)
+
+        return h
+
+
+
+    # ============ forward ============
+
+    def forward(self, x, plot=False):
+        '''
+        x : R ^ (T * B * D)
+        '''
+
+        kld_loss, nll_loss = 0, 0
+
+        # E_q
+        # hidden : R^(n_layers, B, h_dim)
+        h = torch.zeros(self.n_layers, x.size(1), self.h_dim, device=DEVICE) # x.size(1) = B
+
+        data_x = []
+        mean_x = []
+        mean_z = []
+        mean_pr = []
+        sample_z = []
+
+        for t in range(x.size(0)): # x.size(0) = T
+
+            q_mean_t, q_std_t = self.q_enc(x[t], h) # (B, z_dim), (B, z_dim) z_t | x_t, h_t-1
+
+            pr_mean_t, pr_std_t = self.p_pr(h) # (B, z_dim), (B, z_dim) z_t | h_t-1
+
+            kld_loss += self._kld_gauss(pr_mean_t, pr_std_t, q_mean_t, q_std_t)
+
+
+            z_t = torch.randn_like(q_std_t) * q_std_t + q_mean_t # z_t | x_t, h_t-1
+
+            p_mean_t, p_std_t = self.p_dec(z_t, h) # (B, x_dim), (B, x_dim) x_t | z_t, h_t-1
+
+            h = self.f_rec(x[t], z_t, h) # h_t | x_t, z_t, h_t-1
+
+            nll_loss += self._nll_gauss(x[t], p_mean_t, p_std_t)
+
+
+            # plot
+            data_x.append(x[t][0].item())
+            mean_z.append(q_mean_t[0].item())
+            sample_z.append(z_t[0].item())
+            mean_pr.append(pr_mean_t[0].item())
+            mean_x.append(p_mean_t[0].item())
+
+        ent_loss = 0
+
+        # E_p (given x)
+        # hidden : R^(n_layers, B, h_dim)
+        h = torch.zeros(self.n_layers, x.size(1), self.h_dim, device=DEVICE) # x.size(1) = B
+        for t in range(x.size(0)): # x.size(0) = T
+            
+            pr_mean_t, pr_std_t = self.p_pr(h)
+
+            z_t = torch.randn_like(pr_std_t) * pr_std_t + pr_mean_t
+
+            h = self.f_rec(x[t], z_t, h)
+
+            ent_loss += self._ent_gauss(pr_std_t)
+
+
+        if plot:
+            print(f"[{0}/{0}] " + "\t".join(f"{k}:{v:.2f}" for k, v in {
+                'kld_loss': kld_loss,
+                'nll_loss': nll_loss,
+                'ent_loss': ent_loss
+            }.items() ))
+            plt.figure()
+            plt.plot(data_x, label=r'Y_t example')
+            plt.plot(mean_x, label=r'Y_t mean given z_t')
+            plt.plot(mean_z, label=r'sampled \mu^z_t given Y_t')
+            plt.plot(sample_z, label=r'sampled z_t given Y_t')
+            plt.plot(mean_pr, label=r'sampled \mu^z_t given Y_{t-1}')
+            plt.xlabel(r'step t')
+            plt.ylabel(r'Value')
+            plt.title(r'VRNN : forward')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig('/home/marydenya/Downloads/generative-ts/generative-ts/saves/plot.png')
+            plt.close()
+
+        return {
+            'kld_loss': kld_loss,
+            'nll_loss': nll_loss,
+            'ent_loss': ent_loss
+        }
+    
+
+    # ============ test ============
+
+    def sample(self, x, plot = None):
+        '''
+        x : R ^ (T * 1 * D)
+
+        output : R ^ (T * D_z)   hat{z}_t given x_t-1
+        '''
+
+        with torch.no_grad():
+            # (T * D_z)
+            z_sample = torch.zeros(x.size(0), self.z_dim, device=DEVICE) # x.size(0) = T
+
+            # hidden : R^(n_layers, B, h_dim)
+            h = torch.zeros(self.n_layers, 1, self.h_dim, device=DEVICE)
+
+            for t in range(x.size(0)): # x.size(0) = T
+
+                pr_mean_t, pr_std_t = self.p_pr(h) # get mean z_t | h_t 나중에 std_t도 사용
+                z_sample[t] = pr_mean_t.data
+
+                q_mean_t, q_std_t = self.q_enc(x[t], h) 
+        
+                z_t = torch.randn_like(q_std_t) * q_std_t + q_mean_t # sample z_t | x_t, h_t-1
+
+                h = self.f_rec(x[t], z_t, h) # h_t = f(x_t, z_t, h_t-1)
+            
+            return z_sample
+        
+
+
+    def inference(self, x, plot_name = None):
+        '''
+        x : R ^ (T * 1 * D)
+        '''
+        # (T * D_z)
+        z_sample = torch.zeros(x.size(0), self.z_dim, device=DEVICE) # x.size(0) = T
+
+        # for t in range(x.size(0)): z_sample[t] = self.sample(x[:t+1])[t] # (T * D_z)
+
+        z_sample = self.sample(x)
+
+        if plot_name is not None:
+            plt.figure()
+            plt.plot(x.squeeze().cpu().numpy(), label=r'Y_t example')
+            plt.plot(z_sample.squeeze().cpu().numpy(), label=r'sampled \mu^z_{t} given Y_{t-1}')
+            plt.xlabel(r'step t')
+            plt.ylabel(r'Value')
+            plt.title(r'VRNN : sample \theta_t given Y_{t-1}')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(plot_name)
+            plt.close()
+
+        return z_sample
+
+        
+
+
+
+    # ============ loss ============
+
+    def _kld_gauss(self, p_mean, p_std, q_mean, q_std):
+        return ( torch.log(p_std) - torch.log(q_std) + (q_std.pow(2) + (q_mean - p_mean).pow(2)) / (2 * p_std.pow(2)) - 1/2 ).mean()
+  
+    def _nll_gauss(self, x, p_mean_t, p_std_t):
+        return ( torch.log(p_std_t) + math.log(2 * math.pi)/2 + (x - p_mean_t).pow(2)/(2*p_std_t.pow(2)) ).mean()
+    
+    def _ent_gauss(self, std):
+        return ( torch.log(2*math.pi*math.e*(std**2))/2 ).mean()
+
+
+
+
+

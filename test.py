@@ -1,4 +1,4 @@
-import params, data, model, test
+from generative_ts import params, data, model
 from params import DEVICE
 
 import os
