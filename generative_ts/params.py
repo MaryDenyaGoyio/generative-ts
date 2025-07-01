@@ -23,7 +23,7 @@ params = {
         "name": 'VRNN',
         "h_dim": 10,
         "n_layers": 1,
-        "lmbd": 0
+        "lmbd": 10
     },
 
     "outcome": {
@@ -44,4 +44,4 @@ params = {
     }
 }
 
-save = ["v", "tau", "std_Y"]
+save = ["v", "tau", "std_Y", "lmbd"]

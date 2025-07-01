@@ -1,5 +1,5 @@
-import params, data, model
-from params import DEVICE, BASE_DIR, SAVE_DIR
+from . import params, data, model, utils
+from .params import DEVICE, BASE_DIR, SAVE_DIR
 
 import os
 import json
@@ -13,39 +13,13 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 
 
-# ------ load params.py ------
+# ------ load & save ------
 
-cfg = copy.deepcopy(params.params)
-
-# p_Y
-pY_cfg = cfg.get("outcome", {})
-pY_name  = pY_cfg.pop("name", None)
-
-# data.py
-data_cfg = cfg.get("data", {})
-
-# model.py
-model_cfg = cfg.get("model", {})
-model_name = model_cfg.pop("name", None)
-try:    model_cl = getattr(model, model_name)
-except AttributeError: raise RuntimeError(f"No {model_name} in model.py")
-model_main = model_cl(**model_cfg, **pY_cfg).to(DEVICE) # get model
-
-
-# ------ save params.json ------
+data_func, model_main, train_cfg, save_name = utils.load_params()
 
 save_folders = [name for name in os.listdir(SAVE_DIR) if os.path.isdir(os.path.join(SAVE_DIR, name))]
-os.makedirs(save_path := os.path.join(SAVE_DIR, f"{datetime.now().strftime("%y%m%d_%H%M%S")}"), exist_ok=True) # time으로 변경
-
-save_name = f"{model_name}_" + f"_".join(
-        f"{k}_{v}"
-        for section in ('model', 'data', 'train', 'outcome')
-        for k, v in cfg[section].items()
-        if (k in params.save) and not (k == 'name' and v is None)
-    )
-
+os.makedirs(save_path := os.path.join(SAVE_DIR, f"{datetime.now().strftime("%y%m%d_%H%M%S")}"), exist_ok=True)
 with open(os.path.join(save_path, f"params_{save_name}.json"), 'w') as f:   json.dump(params.params, f, indent=2)
-
 
 
 # ============ train ============
@@ -98,7 +72,7 @@ def train(N_epochs, train_loader, model, optimizer, test_seq = None, verbose=1):
 
                 plt.xlabel('epoch')
                 plt.ylabel('loss')
-                plt.title(f'Loss curves (λ = {train_cfg["lmbd"]})')
+                plt.title(f'Loss curves (λ = {model.lmbd})')
                 plt.legend()
                 plt.grid(True)
                 plt.savefig(os.path.join(save_path, f"loss_{save_name}.png"))
@@ -106,19 +80,18 @@ def train(N_epochs, train_loader, model, optimizer, test_seq = None, verbose=1):
 
                 if test_seq is not None:
                     os.makedirs(os.path.join(save_path, 'pred'), exist_ok=True)
-                    model_main.inference(test_seq, os.path.join(save_path, 'pred', f'prediction_{save_name}_{epoch}.png'))
+                    model_main.inference(test_seq, T=test_seq.size(0), N=1, online=False, plot_name=os.path.join(save_path, 'pred', f'prediction_{save_name}_{epoch}.png'))
 
 
 
 # ============ run ============
 
-train_cfg = cfg.get("train", {})
 torch.manual_seed(train_cfg['seed'])
 
 # ------ set data ------
 _Y_N = []
 for _ in range(train_cfg['num_sequences']):
-    Y, _ = data.generate_data(**data_cfg, **pY_cfg)
+    Y, _ = data_func()
     _Y_N.append(Y)
                    
 Y_N = torch.from_numpy(np.stack(_Y_N, axis=0)).float()    # (N, T, D)
