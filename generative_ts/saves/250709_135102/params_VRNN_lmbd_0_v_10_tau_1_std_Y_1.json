@@ -1,0 +1,25 @@
+{
+  "data": {
+    "T": 500,
+    "v": 10,
+    "tau": 1,
+    "sigma_f": 1
+  },
+  "model": {
+    "h_dim": 10,
+    "n_layers": 1,
+    "lmbd": 0
+  },
+  "outcome": {
+    "x_dim": 1,
+    "z_dim": 1,
+    "std_Y": 1
+  },
+  "train": {
+    "n_epochs": 300,
+    "num_sequences": 1000,
+    "batch_size": 100,
+    "learning_rate": 0.001,
+    "seed": 128
+  }
+}

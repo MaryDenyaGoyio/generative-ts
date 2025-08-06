@@ -1,29 +1,74 @@
 import numpy as np
 
-def RBF_kernel(T, tau):
-    t = np.arange(T)
-    return np.exp(-0.5 * ((t[:, None] - t[None, :])**2) / (tau**2))
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 
-def generate_data(**kwargs):
+from abc import ABC, abstractmethod
+from typing import Tuple, Dict
 
-    if kwargs['name'] == 'example_1':
-        prms = ["T", "std_Y", "v", "tau"]
-        T, std_Y, v, tau = [kwargs[prm] for prm in prms]
-        
+import torch
+
+
+class Data_generator(ABC):
+
+    @abstractmethod
+    def generate_data(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        pass
+
+    @abstractmethod
+    def posterior_inference(self, x_past: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        pass
+
+
+
+class GP(Data_generator):
+
+    def __init__(self, **kwargs): # seed
+        self.set_params(**kwargs)
+
+    def set_params(self, **kwargs):
+        prms = ["T", "std_Y", "v", "tau", "sigma_f"]
+        self.T, self.std_Y, self.v, self.tau, self.sigma_f = [kwargs[prm] for prm in prms] # TODO : horizon은 arg로 조절 가능해야할지도?
+    
+    def generate_data(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+
         # e_t + θ^fixed + θ^GP_t
-        noise_Y = np.random.normal(loc=0.0, scale=std_Y, size=T)
+        noise_Y = np.random.normal(loc=0.0, scale=self.std_Y, size=self.T)
 
-        theta_fixed = np.random.normal(loc=0.0, scale=v)
+        theta_fixed = np.random.normal(loc=0.0, scale=self.v)
 
-        theta_gp = np.random.multivariate_normal(mean=np.zeros(T), cov=RBF_kernel(T, tau))
+        theta_gp = GaussianProcessRegressor(kernel=C(self.sigma_f**2) * RBF(length_scale=self.tau), alpha=1e-10).sample_y(np.arange(self.T).reshape(-1, 1), random_state=None).flatten()
 
         return (
-                    (theta_fixed + theta_gp + noise_Y).reshape(T, 1),
+                    (theta_fixed + theta_gp + noise_Y).reshape(self.T, 1),
                     {
                         r"\epsilon_{a,t}"         : noise_Y,
                         r"\theta^{\text{fixed}}_{a}" : theta_fixed,
                         r"\theta^{\text{GP}}_{a,t}"   : theta_gp
                     }
                 )
-    else:
-        return None
+
+    def posterior_inference(self, x_past, T=None, N=100) -> Tuple[np.ndarray, np.ndarray]:
+        '''
+        input : 
+        '''
+
+        if T == None:    T = self.T
+        if isinstance(x_past, torch.Tensor):    x_past = x_past.detach().cpu().numpy()
+        if x_past.ndim == 3:    x_past = x_past.squeeze(1) # (T_x, 1, D) → (T_x, D)
+
+        kernel = C(self.sigma_f**2) * RBF(length_scale=self.tau)
+        gp = GaussianProcessRegressor(kernel=kernel, alpha=self.std_Y**2)
+
+        gp.fit(np.arange(len(x_past)).reshape(-1, 1), x_past)
+
+        mu_future, sigma_GP_future = gp.predict(np.arange(len(x_past), T).reshape(-1, 1), return_std=True)
+
+        sigma_future = np.sqrt(sigma_GP_future**2 + self.std_Y**2)
+
+        x_future = gp.sample_y(np.arange(len(x_past), T).reshape(-1, 1), N).T
+
+        # (T-T_0), (T-T_0), (N, T-T_0)
+        return mu_future, sigma_future, x_future
+
+            

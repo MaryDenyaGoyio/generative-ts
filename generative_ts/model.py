@@ -4,6 +4,8 @@ import os
 import math
 import numpy as np
 import matplotlib.pyplot as plt 
+from typing import Optional, Tuple, Dict
+from torchtyping import TensorType
 
 import torch
 import torch.nn as nn
@@ -91,7 +93,7 @@ class VRNN(nn.Module):
 
 
     # encoder μ_enc( enc(Y_t, h_t) ), σ_enc( enc(Y_t, h_t) )
-    def q_enc(self, x_t, h):
+    def q_enc(self, x_t, h) -> Tuple[torch.Tensor, torch.Tensor]:
         
         phi_x_t = self.phi_x(x_t)
         enc_t = self.enc(torch.cat([phi_x_t, h[-1]], 1))
@@ -102,7 +104,7 @@ class VRNN(nn.Module):
         return q_mean_t, q_std_t
     
     # prior μ_pr( pr(h_t) ), σ_pr( pr(h_t) )
-    def p_pr(self, h):
+    def p_pr(self, h) -> Tuple[torch.Tensor, torch.Tensor]:
 
         pr_t = self.pr(h[-1])
         pr_mean_t = self.pr_mean(pr_t)
@@ -112,7 +114,7 @@ class VRNN(nn.Module):
         return pr_mean_t, pr_std_t
  
     # decoder μ_dec( dec(θ_t, h_t) ), σ_dec( dec(θ_t, h_t) )
-    def p_dec(self, z_t, h):
+    def p_dec(self, z_t, h) -> Tuple[torch.Tensor, torch.Tensor]:
 
         phi_z_t = self.phi_z(z_t)
         dec_t = self.dec(torch.cat([phi_z_t, h[-1]], 1))
@@ -124,7 +126,7 @@ class VRNN(nn.Module):
         return p_mean_t, p_std_t
 
     # recurrence h_t+1 = GRU(θ_t, h_t)
-    def f_rec(self, z_t, h):
+    def f_rec(self, z_t, h) -> torch.Tensor:
 
         phi_z_t = self.phi_z(z_t)
         # input : (B, z_dim) -> (1, B, z_dim)
@@ -136,7 +138,7 @@ class VRNN(nn.Module):
 
     # ============ forward ============
 
-    def forward(self, x, plot=False):
+    def forward(self, x : TensorType["T", "B", "D", torch.float32], plot=False) -> Dict[str, torch.Tensor]:
         '''
         x : R ^ (T * B * D)
         '''
@@ -229,7 +231,7 @@ class VRNN(nn.Module):
 
     # ============ test ============
 
-    def sample(self, x, T, plot_name = None):
+    def sample(self, x : TensorType["T_x", 1, "D", torch.float32], T, plot_name = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         '''
         x : R ^ (T_x * 1 * D)
 
@@ -237,71 +239,70 @@ class VRNN(nn.Module):
         '''
 
         with torch.no_grad():
-            # (T * D_z) # 이거 다 다시 np array로 바꾸기
-            z_sample = np.zeros((T, self.z_dim))
-            z_mean = np.zeros((T, self.z_dim))
-            z_std = np.zeros((T, self.z_dim))
+            # (T * D_z)
+            z_t_with_x_t = np.zeros((T, self.z_dim))
+            z_t_with_x_tm1 = np.zeros((T, self.z_dim))
+            x_t_with_x_tm1 = np.zeros((T, self.x_dim))
+            x_mean_t_with_x_tm1 = np.zeros((T, self.x_dim))
+            x_std_t_with_x_tm1 = np.zeros((T, self.x_dim))
 
             # hidden : R^(n_layers, B, h_dim)
             h = torch.zeros(self.n_layers, 1, self.h_dim, device=DEVICE)
 
             for t in range(T): 
 
-                pr_mean_t, pr_std_t = self.p_pr(h) # get mean z_t | h_t 나중에 std_t도 사용
+                pr_mean_t, pr_std_t = self.p_pr(h) # z_t+1 | h_t from (sample z_t, h_t-1)
+                z_tp1 = torch.randn_like(pr_std_t) * pr_std_t + pr_mean_t # sample z_t+1 by p
 
-                # z_sample[t] = 직접 뽑기
-                z_mean[t] = pr_mean_t.squeeze().cpu().numpy()
-                z_std[t] = pr_std_t.squeeze().cpu().numpy()
+                z_t_with_x_tm1[t] = z_tp1.squeeze().cpu().numpy() 
 
+                p_mean_t, p_std_t = self.p_dec(z_tp1, h) # x_t+1 | z_t+1, h_t
+                x_tp1 = torch.randn_like(p_std_t) * p_std_t + p_mean_t # sample x_t+1 by p
 
-                if t < x.size(0): # x.size(0) = T_x
-                    q_mean_t, q_std_t = self.q_enc(x[t], h)
-                    z_t = torch.randn_like(q_std_t) * q_std_t + q_mean_t # sample z_t | x_t, h_t-1
+                x_t_with_x_tm1[t] = x_tp1.squeeze().cpu().numpy()
+                x_mean_t_with_x_tm1[t] = p_mean_t.squeeze().cpu().numpy()
+                x_std_t_with_x_tm1[t] = p_std_t.squeeze().cpu().numpy()
+
+                if t < x.size(0):
+                    q_mean_t, q_std_t = self.q_enc(x[t], h) # z_t | x_t, h_t-1
+                    z_t = torch.randn_like(q_std_t) * q_std_t + q_mean_t # sample z_t by q
 
                 else:
-                    pr_mean_t, pr_std_t = self.p_pr(h)
-                    z_t = torch.randn_like(pr_std_t) * pr_std_t + pr_mean_t # sample z_t | h_t-1            
-                
+                    pr_mean_t, pr_std_t = self.p_pr(h) # z_t | h_t-1
+                    z_t = torch.randn_like(pr_std_t) * pr_std_t + pr_mean_t # sample z_t by p
+
+                z_t_with_x_t[t] = z_t.squeeze().cpu().numpy() 
 
                 h = self.f_rec(z_t, h) # h_t = f(z_t, h_t-1)
+
             
-            return z_sample, z_mean, z_std
+            return z_t_with_x_t, z_t_with_x_tm1, x_t_with_x_tm1, x_mean_t_with_x_tm1, x_std_t_with_x_tm1
         
 
 
-    def inference(self, x, T, N=100, online = True, plot_name = None):
+    def inference(self, x: TensorType["T_x", 1, "D", torch.float32], T, N=500, verbose=2) -> np.ndarray:
         '''
         x : R ^ (T_x * 1 * D)
         '''
         # (T * D_z)
-        z_samples = np.zeros((N, T, self.z_dim))
-        z_means = np.zeros((N, T, self.z_dim))
-        z_stds = np.zeros((N, T, self.z_dim))
+        x_samples = np.zeros((N, T, self.x_dim))
+        x_means = np.zeros((N, T, self.x_dim))
+        x_stds = np.zeros((N, T, self.x_dim))
 
         for i in range(N):
-            z_samples[i], z_means[i], z_stds[i] = self.sample(x, T)
+            if i%100==0 and verbose>1:    print(i)
+            _, _, x_samples[i], x_means[i], x_stds[i] = self.sample(x, T)
         
         # for t in range(x.size(0)): z_sample[t] = self.sample(x[:t+1])[t] # (T * D_z)
 
-        z_mean_avg = z_means.mean(axis=0)[:, 0]  # shape (T, D_z)
-        z_std_avg = z_stds.mean(axis=0)[:, 0]    # shape (T, D_z)
+        mean_samples = x_means.mean(axis=0)
 
+        var_alea = (x_stds ** 2).mean(axis=0)  # aleatoric
+        var_epis = x_means.var(axis=0)    # epistemic
+        var_samples = np.sqrt(var_alea + var_epis)
 
-        if plot_name is not None:
-            plt.figure()
-            plt.plot(x.squeeze().cpu().numpy(), label=r'$Y_t$ example')
-            z_line, = plt.plot(z_mean_avg, label=r'$\theta_t | Y_{< t}, \theta_{< t}$')
-            plt.fill_between(np.arange(T)[(x.size(0) if online else 0):], (z_mean_avg - z_std_avg)[(x.size(0) if online else 0):], (z_mean_avg + z_std_avg)[(x.size(0) if online else 0):], alpha=0.2, color=z_line.get_color())
-            if online:  plt.axvline(x=x.size(0)-1, color='black', linestyle='--', linewidth=1.0)
-            plt.xlabel(r'step t')
-            plt.ylabel(r'Value')
-            plt.title(f'VRNN λ={self.lmbd}')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(plot_name)
-            plt.close()
-
-        return z_samples
+        # (T-T_0 * D), (T-T_0 * D?), (N * T-T_0 * D)
+        return mean_samples[x.size(0):], var_samples[x.size(0):], x_samples[:, x.size(0):]
 
         
 
@@ -309,16 +310,96 @@ class VRNN(nn.Module):
 
     # ============ loss ============
 
-    def _kld_gauss(self, pr_mean, pr_std, q_mean, q_std):
+    def _kld_gauss(self, pr_mean, pr_std, q_mean, q_std) -> torch.Tensor:
         return ( torch.log(pr_std) - torch.log(q_std) + (q_std.pow(2) + (q_mean - pr_mean).pow(2)) / (2 * pr_std.pow(2)) - 1/2 ).mean()
-  
-    def _nll_gauss(self, x, p_mean_t, p_std_t):
+    
+    def _nll_gauss(self, x, p_mean_t, p_std_t)-> torch.Tensor:
         return ( torch.log(p_std_t) + math.log(2 * math.pi)/2 + (x - p_mean_t).pow(2)/(2*p_std_t.pow(2)) ).mean()
     
-    def _ent_gauss(self, pr_std_t):
+    def _ent_gauss(self, pr_std_t) -> torch.Tensor:
         return self.lmbd * ( torch.log(2*math.pi*math.e*(pr_std_t**2))/2 ).mean()
 
 
 
 
 
+"""
+============================================================================================================
+============================================================================================================
+============================================================================================================
+====================================                                    ====================================
+====================================                LS4                 ====================================
+====================================                                    ====================================
+============================================================================================================
+============================================================================================================
+============================================================================================================
+"""
+
+from ls4.models.ls4 import VAE as LS4Model
+
+
+class LS4(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # config 는 params.py 에서 OmegaConf 등으로 읽은 LS4용 config
+        self.model = LS4Model(config)
+        # autoregressive sampling 속도 조정을 위해
+        self.model.setup_rnn(mode=getattr(config, 'rnn_mode', 'dense'))
+        self.lmbd = 0
+
+    def forward(self, x: torch.Tensor, plot=False):
+        T, B, D = x.shape
+        x_ls4 = x.permute(1, 0, 2)
+        timepoints = torch.arange(T, device=x.device)
+        masks = torch.ones(B, T, 1, device=x.device)
+
+        total_loss, log_info = self.model(x_ls4, timepoints, masks, plot=plot)
+
+        # log_info에는 kld_loss, nll_loss 등 (float or tensor) 있음
+        # total_loss는 항상 torch.Tensor임
+        # dict로 합쳐서 반환
+        result = {'total_loss': total_loss}
+        # log_info의 모든 값 추가 (float이나 tensor 상관없이)
+        result.update(log_info)
+        # 필요하면 ent_loss도 넣기
+        result['ent_loss'] = torch.tensor(0., device=x.device)
+        return result
+
+    def sample(self,
+               x: torch.Tensor,     # shape (T₀, 1, D)
+               T: int):
+        # LS4 는 generate(B, timepoints) 만 제공 → x_t0 까지는 posterior, 이후 p(z), p(x)
+        T0, B, D = x.shape
+        assert B == 1, "샘플링 배치 크기는 1만 지원"
+        # 이후 T0+T 길이의 timepoints 생성
+        tp = torch.arange(T0 + T, device=x.device)
+        # autoregressive 모드로 바꿔야 generate() 가 recurrence 를 사용
+        self.model.setup_rnn(mode='diagonal')
+        x_full = self.model.generate(1, tp)  # (1, T0+T, D)
+        x_full = x_full.squeeze(0).cpu().numpy()  # (T0+T, D)
+        # 돌려줄 값:  
+        #  - z_t_with_x_t 처럼 세 가지 배열 대신, x_full[T0:] 만 반환해도 무방
+        return x_full[:T0], x_full[T0:]
+
+    def inference(self,
+                  x: torch.Tensor,  # (T₀, 1, D)
+                  T: int,
+                  N: int = 500,
+                  verbose: int = 2):
+        # VRNN inference: 평균, 분산, 샘플 N개
+        T0, B, D = x.shape
+        assert B == 1
+        # LS4 predict 는 분류용 → 여기서는 posterior 샘플링을 N번 반복
+        means = []
+        vars_ = []
+        samples = []
+        for i in range(N):
+            if i % 100 == 0 and verbose > 1: print(i)
+            x0, x_pred = self.sample(x, T)
+            means.append(x_pred)
+            # 분산 계산은 샘플링 결과로 직접
+            samples.append(x_pred)
+        arr = np.stack(samples, axis=0)  # (N, T, D)
+        mean = arr.mean(0)
+        var = arr.var(0)
+        return mean, np.sqrt(var), arr
