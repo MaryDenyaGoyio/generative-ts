@@ -32,9 +32,9 @@ params = {
     },
 
     "train": {
-        "n_epochs": 10,
-        "num_sequences": 10,
-        "batch_size": 10,
+        "n_epochs": 300,
+        "num_sequences": 1000,
+        "batch_size": 100,
 
         "learning_rate": 1e-3,
 
