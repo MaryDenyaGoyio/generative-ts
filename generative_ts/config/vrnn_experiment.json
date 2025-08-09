@@ -1,0 +1,22 @@
+{
+  "model_type": "VRNN",
+  "data": {
+    "T": 300,
+    "tau": 10,
+    "v": 10,
+    "std_Y": 0.01,
+    "sigma_f": 1
+  },
+  "model": {
+    "z_dim": 10,
+    "h_dim": 100,
+    "n_layers": 1,
+    "lmbd": 0
+  },
+  "train": {
+    "num_sequences": 10000,
+    "batch_size": 100,
+    "n_epochs": 1000,
+    "learning_rate": 0.01
+  }
+}

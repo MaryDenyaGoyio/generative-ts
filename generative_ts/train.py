@@ -15,12 +15,11 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
 from .data import GP
-from .model import VRNN_ts, LS4_ts, AttrDict, dict2attr
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def train(model, data_generator, train_config, save_path, model_name):
+def train(model, data_generator, train_config, save_path, model_name, n_eval=10):
     """
     Unified training function for both VRNN_ts and LS4_ts models
     
@@ -61,7 +60,7 @@ def train(model, data_generator, train_config, save_path, model_name):
     if model_name == 'LS4':
         timepoints = torch.linspace(0.0, 1.0, T, device=DEVICE)
     
-    print(f"모델 파라미터 수: {sum(p.numel() for p in model.parameters())}")
+    print(f"number of model parameters: {sum(p.numel() for p in model.parameters())}")
     
     # Training loop
     all_losses = {}
@@ -116,15 +115,18 @@ def train(model, data_generator, train_config, save_path, model_name):
             
             # Loss logging
             for name, each_loss in loss_dict.items():
-                if isinstance(each_loss, torch.Tensor):
-                    value = (
-                        each_loss.detach().cpu().item()
-                        if each_loss.dim() == 0
-                        else each_loss.mean().detach().cpu().item()
-                    )
-                else:
-                    value = each_loss  # float
-                all_losses.setdefault(name, [0] * (epoch + 1))[epoch] += value / num_batches
+
+                if name.endswith("loss"):
+                    if isinstance(each_loss, torch.Tensor):
+                        value = (
+                            each_loss.detach().cpu().item()
+                            if each_loss.dim() == 0
+                            else each_loss.mean().detach().cpu().item()
+                        )
+                    else:
+                        value = each_loss  # float
+
+                    all_losses.setdefault(name, [0] * (epoch + 1))[epoch] += value / num_batches
         
         elapsed = time.time() - start
         
@@ -135,10 +137,13 @@ def train(model, data_generator, train_config, save_path, model_name):
         tqdm.write(log_msg)
         
         # Save checkpoints and plots every 10 epochs
-        if epoch % 10 == 0:
+        if epoch % n_eval == 0:
             # Save model
+            tqdm.write(f"[{epoch // n_eval}/{train_config['n_epochs'] // n_eval}]", end=" | ")
+            start = time.time()
+
             torch.save(model.state_dict(), 
-                      os.path.join(save_path, f"model_{model_name}_epoch_{epoch}.pth"))
+                      os.path.join(save_path, f"model_{model_name}.pth"))
             
             # Loss plot
             plt.figure()
@@ -156,8 +161,13 @@ def train(model, data_generator, train_config, save_path, model_name):
             # Extrapolation plot using model's posterior method
             plot_posterior(data_generator, model, x_test, t_0, T, 
                          save_path, epoch, model_name)
+            
+            elapsed = time.time() - start
+            # 뭐 이 자리에 나중에 loss도 출력할지도?
+            tqdm.write(f"eval: {elapsed:.2f}s")
     
     return model
+
 
 
 def plot_posterior(data_generator, model, x_test, t_0, T, save_path, epoch, model_name):
@@ -169,60 +179,83 @@ def plot_posterior(data_generator, model, x_test, t_0, T, save_path, epoch, mode
         
         # Model inference using unified posterior method
         x_given_model = x_given.unsqueeze(1)  # (T0, 1, D)
-        mean_samples, var_samples, x_samples = model.posterior(x_given_model, T=T, N=100, verbose=0)
-        
+        mean_samples, var_samples, x_samples = model.posterior(x_given_model, T=T, N=20, verbose=0)
+
+        # model.posterior(...) 바로 다음
+        _to_np = lambda x: x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
+        tqdm.write(f"[{epoch}] mean={_to_np(mean_samples)}, var={_to_np(var_samples)}, samples={_to_np(x_samples)}")
+
         # GP posterior (ground truth)
         x_given_np = x_given.squeeze().detach().cpu().numpy()
-        mu_future, sigma_future, x_future = data_generator.posterior(x_given_np, T=T, N=10)
+        mu_future, sigma_future, x_future = data_generator.posterior(x_given_np, T=T, N=20)
         
-        # Plot
-        geq_t_0 = np.arange(t_0, T)
+        # Plot - now handle full sequence
+        t_full = np.arange(T)  # Full time range
+        t_given = np.arange(t_0)  # Given time range  
+        t_pred = np.arange(t_0, T)  # Prediction time range
         plot_name = os.path.join(save_path, "pred", f"test_{model_name}_{epoch}.png")
 
         plt.figure(figsize=(12, 6))
         
-        # Given data
-        plt.plot(x_given.squeeze().cpu().numpy(), 
-                 label=r'$given Y_{\leq t_0}$', color='#1f77b4', linewidth=2)
+        # Given data (conditioning part)
+        plt.plot(t_given, x_given.squeeze().cpu().numpy(), 
+                 label=r'$given Y_{\leq t_0}$', color='#1f77b4', linewidth=2, marker='o', markersize=3)
 
-        # GP posterior (ground truth)
-        gp_line, = plt.plot(geq_t_0, mu_future, 
+        # GP posterior (ground truth) - future part only
+        gp_line, = plt.plot(t_pred, mu_future, 
                            label=r'$Y_{>t_0} | Y_{\leq t_0}$ by GP', 
                            color='#ff7f0e', linewidth=2)
-        plt.fill_between(geq_t_0, 
+        plt.fill_between(t_pred, 
                         (mu_future - sigma_future), 
                         (mu_future + sigma_future), 
                         alpha=0.2, color=gp_line.get_color())
 
-        # Model posterior
-        model_line, = plt.plot(geq_t_0, mean_samples.squeeze(), 
-                              label=f'$Y_{{>t_0}} | Y_{{\leq t_0}}$ by {model_name}', 
+        # Model posterior - full sequence, but highlight prediction part
+        model_mean_given = mean_samples[:t_0].squeeze() if mean_samples.ndim > 1 else mean_samples[:t_0]
+        model_var_given = var_samples[:t_0].squeeze() if var_samples.ndim > 1 else var_samples[:t_0]
+        model_mean_pred = mean_samples[t_0:].squeeze() if mean_samples.ndim > 1 else mean_samples[t_0:]
+        model_var_pred = var_samples[t_0:].squeeze() if var_samples.ndim > 1 else var_samples[t_0:]
+        
+        # Model reconstruction (conditioning part) - lighter color
+        plt.plot(t_given, model_mean_given, 
+                color='#2ca02c', alpha=0.7, linewidth=1.5, linestyle='-', 
+                label=f'{model_name} reconstruction')
+        plt.fill_between(t_given, 
+                        model_mean_given - model_var_given, 
+                        model_mean_given + model_var_given, 
+                        alpha=0.1, color='#2ca02c')
+        
+        # Model prediction (extrapolation part) - full color
+        model_line, = plt.plot(t_pred, model_mean_pred, 
+                              label=f'{model_name} extrapolation', 
                               color='#2ca02c', linewidth=2)
-        plt.fill_between(geq_t_0, 
-                        (mean_samples - var_samples).squeeze(), 
-                        (mean_samples + var_samples).squeeze(), 
+        plt.fill_between(t_pred, 
+                        model_mean_pred - model_var_pred, 
+                        model_mean_pred + model_var_pred, 
                         alpha=0.2, color=model_line.get_color())
 
-        # Sample trajectories
-        n_traj = min(10, x_future.shape[0], x_samples.shape[0])
+        # Sample trajectories - prediction part only for clarity
+        n_traj = min(5, x_future.shape[0], x_samples.shape[0])
         if x_future.shape[0] > 0:
-            plt.plot(geq_t_0, x_future[:n_traj].T, 
+            plt.plot(t_pred, x_future[:n_traj].T, 
                     color=gp_line.get_color(), alpha=0.3, 
                     linestyle='--', linewidth=1.0, label='_nolegend_')
         
         if x_samples.shape[0] > 0:
-            if x_samples.ndim == 3:  # (N, T-T0, D)
-                samples_plot = x_samples[:n_traj, :, 0].T  # (T-T0, n_traj)
-            else:  # (N, T-T0)
-                samples_plot = x_samples[:n_traj].T  # (T-T0, n_traj)
-            plt.plot(geq_t_0, samples_plot, 
+            # Extract prediction part from samples
+            if x_samples.ndim == 3:  # (N, T, D)
+                samples_pred = x_samples[:n_traj, t_0:, 0].T  # (T-T0, n_traj)
+            else:  # (N, T)
+                samples_pred = x_samples[:n_traj, t_0:].T  # (T-T0, n_traj)
+            plt.plot(t_pred, samples_pred, 
                     color=model_line.get_color(), alpha=0.3, 
                     linestyle='--', linewidth=1.0, label='_nolegend_')
 
         plt.axvline(x=t_0, color='black', linestyle='--', linewidth=1.0)
         plt.xlabel(r'step t')
         plt.ylabel(r'Value')
-        plt.title(f'{model_name} vs GP extrapolation (Epoch {epoch})')
+        plt.title(f'{model_name} vs GP posterior (Epoch {epoch})')
         plt.legend()
         plt.grid(True)
         plt.savefig(plot_name, dpi=150, bbox_inches='tight')
@@ -263,6 +296,8 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
     train_config = config['train']
     
     if model_type == 'VRNN':
+        from .model.vrnn import VRNN_ts
+
         model = VRNN_ts(
             x_dim=1,
             z_dim=model_config.get('z_dim', 1),
@@ -273,8 +308,9 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
         ).to(DEVICE)
         
     elif model_type == 'LS4':
+        from .model.ls4 import LS4_ts, AttrDict, dict2attr
         # Load LS4 config
-        cfg_path = model_config.get('config_path', 'ls4/configs/monash/vae_nn5daily.yaml')
+        cfg_path = model_config.get('config_path', 'generative_ts/config/ls4_config.yaml')
         cfg_all = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
         cfg_all = dict2attr(cfg_all)
         ls4_config = cfg_all.model
@@ -284,6 +320,8 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
         ls4_config.classifier = False
         
         model = LS4_ts(ls4_config).to(DEVICE)
+        # Setup RNN for inference/generation
+        model.setup_rnn(mode='dense')
         
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
