@@ -1,36 +1,22 @@
 import numpy as np
+import torch
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 
-from abc import ABC, abstractmethod
 from typing import Tuple, Dict
 
-import torch
 
-
-class Data_generator(ABC):
-
-    @abstractmethod
-    def generate_data(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        pass
-
-    @abstractmethod
-    def posterior_inference(self, x_past: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        pass
-
-
-
-class GP(Data_generator):
+class GP():
 
     def __init__(self, **kwargs): # seed
         self.set_params(**kwargs)
 
     def set_params(self, **kwargs):
         prms = ["T", "std_Y", "v", "tau", "sigma_f"]
-        self.T, self.std_Y, self.v, self.tau, self.sigma_f = [kwargs[prm] for prm in prms] # TODO : horizon은 arg로 조절 가능해야할지도?
+        self.T, self.std_Y, self.v, self.tau, self.sigma_f = [kwargs[prm] for prm in prms]
     
-    def generate_data(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    def data(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
 
         # e_t + θ^fixed + θ^GP_t
         noise_Y = np.random.normal(loc=0.0, scale=self.std_Y, size=self.T)
@@ -48,9 +34,10 @@ class GP(Data_generator):
                     }
                 )
 
-    def posterior_inference(self, x_past, T=None, N=100) -> Tuple[np.ndarray, np.ndarray]:
+    def posterior(self, x_past, T=None, N=100) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         '''
-        input : 
+        input : x_past - observed data up to t_0
+        output : mu_future, sigma_future, x_future samples
         '''
 
         if T == None:    T = self.T
@@ -70,5 +57,3 @@ class GP(Data_generator):
 
         # (T-T_0), (T-T_0), (N, T-T_0)
         return mu_future, sigma_future, x_future
-
-            
