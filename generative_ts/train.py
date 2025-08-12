@@ -82,7 +82,9 @@ def train(model, data_generator, train_config, save_path, model_name, n_eval=10)
             
             # Model-specific forward pass
             if model_name == 'VRNN':
-                data = data.to(DEVICE).transpose(0, 1)  # (B, T, D) -> (T, B, D)
+                # VRNN expects (T, B, D) where D=1 for our 1D time series
+                data = data.to(DEVICE).unsqueeze(-1)  # (B, T) -> (B, T, 1)
+                data = data.transpose(0, 1)  # (B, T, 1) -> (T, B, 1)
                 loss_dict = model(data)
                 
                 # Calculate total loss
@@ -93,8 +95,28 @@ def train(model, data_generator, train_config, save_path, model_name, n_eval=10)
                 
             elif model_name == 'LS4':
                 data = data.to(DEVICE).unsqueeze(-1)  # (B, T) -> (B, T, 1)
-                masks = torch.ones(data.shape[0], data.shape[1], 1, device=DEVICE)
+                
+                # FIXED: Train with partial observation using masking
+                # This forces the model to learn temporal dynamics for extrapolation
+                T_full = data.shape[1]
+                T_given = int(0.75 * T_full)  # first 75% observed, last 25% to predict
+                
+                # Create masks: 1 for observed, 0 for unobserved (to be predicted)
+                masks = torch.ones_like(data, device=DEVICE)  # (B, T, 1)
+                masks[:, T_given:] = 0.0  # mask out future part during training
+                
+                # Train model to reconstruct full sequence from partial observation
                 train_loss, loss_dict = model(data, timepoints, masks, plot=False, sum=True)
+                
+                # Add extrapolation-specific loss if available
+                if hasattr(model, 'extrapolate_loss'):
+                    data_given = data[:, :T_given]  # (B, T_given, 1)
+                    timepoints_given = timepoints[:T_given]
+                    timepoints_pred = timepoints[T_given:]
+                    
+                    extrap_loss = model.extrapolate_loss(data_given, timepoints_given, 
+                                                       timepoints_pred, data[:, T_given:])
+                    train_loss = train_loss + extrap_loss
             
             else:
                 raise ValueError(f"Unknown model_name: {model_name}")
@@ -160,7 +182,7 @@ def train(model, data_generator, train_config, save_path, model_name, n_eval=10)
             
             # Extrapolation plot using model's posterior method
             plot_posterior(data_generator, model, x_test, t_0, T, 
-                         save_path, epoch, model_name)
+                         save_path, f"test_{model_name}_{epoch}.png", f'{model_name} vs GP posterior (Epoch {epoch})')
             
             elapsed = time.time() - start
             # 뭐 이 자리에 나중에 loss도 출력할지도?
@@ -170,7 +192,7 @@ def train(model, data_generator, train_config, save_path, model_name, n_eval=10)
 
 
 
-def plot_posterior(data_generator, model, x_test, t_0, T, save_path, epoch, model_name):
+def plot_posterior(data_generator, model, x_test, t_0, T, save_path, save_name, plot_name):
     """올바른 베이지안 inference로 extrapolation 플롯"""
     
     model.eval()
@@ -178,13 +200,8 @@ def plot_posterior(data_generator, model, x_test, t_0, T, save_path, epoch, mode
         x_given = x_test[:t_0]
         
         # Model inference using unified posterior method
-        x_given_model = x_given.unsqueeze(1)  # (T0, 1, D)
+        x_given_model = x_given.unsqueeze(-1).unsqueeze(-1)  # (T0, 1, 1)
         mean_samples, var_samples, x_samples = model.posterior(x_given_model, T=T, N=20, verbose=0)
-
-        # model.posterior(...) 바로 다음
-        _to_np = lambda x: x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
-
-        tqdm.write(f"[{epoch}] mean={_to_np(mean_samples)}, var={_to_np(var_samples)}, samples={_to_np(x_samples)}")
 
         # GP posterior (ground truth)
         x_given_np = x_given.squeeze().detach().cpu().numpy()
@@ -194,7 +211,7 @@ def plot_posterior(data_generator, model, x_test, t_0, T, save_path, epoch, mode
         t_full = np.arange(T)  # Full time range
         t_given = np.arange(t_0)  # Given time range  
         t_pred = np.arange(t_0, T)  # Prediction time range
-        plot_name = os.path.join(save_path, "pred", f"test_{model_name}_{epoch}.png")
+        plot_name = os.path.join(save_path, "pred", save_name)
 
         plt.figure(figsize=(12, 6))
         
@@ -220,7 +237,7 @@ def plot_posterior(data_generator, model, x_test, t_0, T, save_path, epoch, mode
         # Model reconstruction (conditioning part) - lighter color
         plt.plot(t_given, model_mean_given, 
                 color='#2ca02c', alpha=0.7, linewidth=1.5, linestyle='-', 
-                label=f'{model_name} reconstruction')
+                label=r"$Y'_{\leq t_0} | Y_{\leq t_0}$ by " + f'{model.__class__.__name__}')
         plt.fill_between(t_given, 
                         model_mean_given - model_var_given, 
                         model_mean_given + model_var_given, 
@@ -228,7 +245,7 @@ def plot_posterior(data_generator, model, x_test, t_0, T, save_path, epoch, mode
         
         # Model prediction (extrapolation part) - full color
         model_line, = plt.plot(t_pred, model_mean_pred, 
-                              label=f'{model_name} extrapolation', 
+                              label=r'$Y_{>t_0} | Y_{\leq t_0}$ by ' + f'{model.__class__.__name__}', 
                               color='#2ca02c', linewidth=2)
         plt.fill_between(t_pred, 
                         model_mean_pred - model_var_pred, 
@@ -255,7 +272,7 @@ def plot_posterior(data_generator, model, x_test, t_0, T, save_path, epoch, mode
         plt.axvline(x=t_0, color='black', linestyle='--', linewidth=1.0)
         plt.xlabel(r'step t')
         plt.ylabel(r'Value')
-        plt.title(f'{model_name} vs GP posterior (Epoch {epoch})')
+        plt.title(plot_name)
         plt.legend()
         plt.grid(True)
         plt.savefig(plot_name, dpi=150, bbox_inches='tight')
@@ -285,6 +302,13 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
     # Save config
     with open(os.path.join(save_path, "config.json"), 'w') as f:
         json.dump(config, f, indent=2)
+    
+    # Save yaml config if specified
+    if 'model' in config and 'config_path' in config['model']:
+        yaml_config_path = config['model']['config_path']
+        if os.path.exists(yaml_config_path):
+            import shutil
+            shutil.copy2(yaml_config_path, os.path.join(save_path, "ls4_config.yaml"))
     
     # Create data generator
     data_config = config['data']

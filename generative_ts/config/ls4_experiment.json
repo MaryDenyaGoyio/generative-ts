@@ -11,7 +11,7 @@
     "config_path": "generative_ts/config/ls4_config.yaml"
   },
   "train": {
-    "num_sequences": 10000,
+    "num_sequences": 10,
     "batch_size": 100,
     "n_epochs": 1000,
     "learning_rate": 0.001

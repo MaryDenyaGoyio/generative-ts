@@ -29,7 +29,7 @@ def main():
         config_file = sys.argv[1]
     else:
         # 기본값: LS4 실험
-        config_file = "generative_ts/config/vrnn_experiment.json"
+        config_file = "generative_ts/config/ls4_experiment.json"
     
     # Config 로드
     print(f"Loading config from: {config_file}")

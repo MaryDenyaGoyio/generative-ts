@@ -1,0 +1,19 @@
+{
+  "model_type": "LS4",
+  "data": {
+    "T": 300,
+    "tau": 10,
+    "v": 10,
+    "std_Y": 0.01,
+    "sigma_f": 1
+  },
+  "model": {
+    "config_path": "generative_ts/config/ls4_config.yaml"
+  },
+  "train": {
+    "num_sequences": 10000,
+    "batch_size": 100,
+    "n_epochs": 1000,
+    "learning_rate": 0.001
+  }
+}

@@ -61,7 +61,7 @@ class VRNN_ts(VRNN):
             
             # Our modification: decoder outputs z_t with fixed sigma
             dec_mean_t = z_t  # p(x_t | z_t) = N(z_t, sigma^2)
-            dec_std_t = torch.ones_like(dec_mean_t) * self.std_Y
+            dec_std_t = torch.ones_like(dec_mean_t) * torch.tensor(self.std_Y, device=dec_mean_t.device, dtype=dec_mean_t.dtype)
             
             # recurrence (unchanged from original)
             _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
@@ -96,7 +96,9 @@ class VRNN_ts(VRNN):
         for t in range(T):
             if t < T_0:
                 # Conditioning phase: use encoder
-                phi_x_t = self.phi_x(x_given[t])
+                # Ensure x_given[t] has the correct shape (1, x_dim)
+                x_t = x_given[t].unsqueeze(0) if x_given[t].dim() == 1 else x_given[t]
+                phi_x_t = self.phi_x(x_t)
                 enc_t = self.enc(torch.cat([phi_x_t, h[-1]], 1))
                 enc_mean_t = self.enc_mean(enc_t)
                 enc_std_t = self.enc_std(enc_t)
@@ -104,7 +106,7 @@ class VRNN_ts(VRNN):
                 
                 # "Decode" using our modified decoder
                 x_mean = z_t
-                x_std = torch.ones_like(x_mean) * self.std_Y
+                x_std = torch.ones_like(x_mean) * torch.tensor(self.std_Y, device=x_mean.device, dtype=x_mean.dtype)
                 x_sample = x_given[t]  # Use actual observation
             else:
                 # Prediction phase: use prior
@@ -115,11 +117,13 @@ class VRNN_ts(VRNN):
                 
                 # "Decode" using our modified decoder
                 x_mean = z_t
-                x_std = torch.ones_like(x_mean) * self.std_Y  
+                x_std = torch.ones_like(x_mean) * torch.tensor(self.std_Y, device=x_mean.device, dtype=x_mean.dtype)
                 x_sample = self._reparameterized_sample(x_mean, x_std)
             
             # Update RNN state
-            phi_x_t = self.phi_x(x_sample)
+            # Ensure x_sample has the correct shape (1, x_dim) for phi_x
+            x_sample_t = x_sample.unsqueeze(0) if x_sample.dim() == 1 else x_sample
+            phi_x_t = self.phi_x(x_sample_t)
             phi_z_t = self.phi_z(z_t)
             _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
             
@@ -182,3 +186,9 @@ class VRNN_ts(VRNN):
     def _entropy_gauss(self, std):
         """Gaussian entropy: 0.5 * log(2πe * σ²)"""
         return 0.5 * torch.log(2 * math.pi * math.e * std.pow(2)).sum()
+    
+    def _nll_gauss(self, mean, std, x):
+        """Override _nll_gauss to handle EPS as tensor"""
+        EPS = torch.tensor(torch.finfo(std.dtype).eps, device=std.device, dtype=std.dtype)
+        pi = torch.tensor(torch.pi, device=std.device, dtype=std.dtype)
+        return torch.sum(torch.log(std + EPS) + torch.log(2*pi)/2 + (x - mean).pow(2)/(2*std.pow(2)))

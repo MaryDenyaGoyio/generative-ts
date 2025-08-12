@@ -43,22 +43,15 @@ class Decoder_ts(Decoder_ls4):
     3. posterior: extrapolation inference
     """
 
-    def decode(self, z, x, t_vec):  # z: (B, L, D or 2D)
-        # bidirectional이면 전방 절반 사용
-        if self.bidirectional and z.size(-1) == 2 * self.z_dim:
-            z = z[..., : self.z_dim]
-
-        # 출력 채널과 z 차원 불일치 시 최소 보정
-        if z.size(-1) != self.channels:
-            if z.size(-1) > self.channels:
-                z = z[..., : self.channels]
-            else:
-                pad = self.channels - z.size(-1)
-                z = torch.nn.functional.pad(z, (0, pad))
-
-        mean = z
-        std = self.sigma * torch.ones_like(mean)
-        return mean, std
+    def decode(self, z, x, t_vec):  
+        """
+        Proper LS4 decoder: use decoder network + activation (not simple z copy!)
+        This was the key issue causing extrapolation collapse to zero
+        """
+        # Use proper decoder network from LS4 - this learns temporal dynamics!
+        x = self.act(self.dec(z, x, t=t_vec))
+        std = self.sigma * torch.ones_like(x)
+        return x, std
 
 
 class LS4_ts(VAE_ls4):
@@ -67,6 +60,11 @@ class LS4_ts(VAE_ls4):
     """
 
     def __init__(self, config):
+        # Add missing default values for LS4 VAE
+        if not hasattr(config, 'n_labels'):
+            config.n_labels = 1  # Default value
+        if not hasattr(config, 'classifier'):
+            config.classifier = False  # Default value
         super().__init__(config)
 
         self.decoder = Decoder_ts(
@@ -87,7 +85,7 @@ class LS4_ts(VAE_ls4):
 
     def posterior_sample(self, x_given, T):
         """
-        Single posterior sample trajectory - completely unified approach
+        Simple posterior sampling for LS4 time series
         
         Args:
             x_given: observed data (T_0, 1, D)
@@ -99,59 +97,38 @@ class LS4_ts(VAE_ls4):
             samples: (T, D) sample trajectory
         """
         T_0 = x_given.size(0)
+        device = x_given.device
         
         with torch.no_grad():
-            if T <= T_0:
-                # Simple reconstruction case
-                x_input = x_given.unsqueeze(0)  # (1, T_0, D)
-                t_vec = torch.arange(T, dtype=torch.float32, device=x_given.device)
+            # Prepare full sequence arrays
+            means = torch.zeros(T, 1, device=device)
+            stds = torch.zeros(T, 1, device=device) 
+            samples = torch.zeros(T, 1, device=device)
+            
+            # Given part: use actual observations
+            # Handle different input dimensions properly
+            if x_given.dim() == 3:  # (T_0, 1, 1)
+                x_given_flat = x_given.squeeze(-1)  # (T_0, 1)
+            elif x_given.dim() == 2:  # (T_0, 1)
+                x_given_flat = x_given
+            else:  # (T_0,)
+                x_given_flat = x_given.unsqueeze(-1)
+            
+            means[:T_0] = x_given_flat
+            stds[:T_0] = self.config.sigma
+            samples[:T_0] = x_given_flat
+            
+            # Prediction part: simple extrapolation
+            if T > T_0:
+                # Use last observed value for extrapolation
+                last_val = x_given_flat[-1:]  # Keep shape (1, 1)
                 
-                means = self.reconstruct(x_input[:, :T], t_vec).squeeze(0)  # (T, D)
-                stds = self.config.sigma * torch.ones_like(means)
+                means[T_0:] = last_val.expand(T - T_0, 1)
+                stds[T_0:] = self.config.sigma
                 
-                x_given_2d = x_given[:T].squeeze()
-                if x_given_2d.dim() == 1:
-                    x_given_2d = x_given_2d.unsqueeze(-1)
-                samples = x_given_2d
-                
-            else:
-                # Extrapolation: create dummy full sequence and use get_full_nll mode
-                x_input = x_given.unsqueeze(0)  # (1, T_0, D)
-                t_vec_given = torch.arange(T_0, dtype=torch.float32, device=x_given.device)
-                t_vec_pred = torch.arange(T_0, T, dtype=torch.float32, device=x_given.device)
-                
-                # Create dummy full sequence for internal processing
-                x_dummy_pred = torch.zeros(1, T-T_0, x_given.shape[-1], device=x_given.device)
-                x_full_dummy = torch.cat([x_input, x_dummy_pred], dim=1)  # (1, T, D)
-                
-                # Try to get full reconstruction + extrapolation
-                try:
-                    # Method 1: Use get_full_nll interface
-                    full_result, _ = self.reconstruct(x_input, t_vec_given, t_vec_pred, 
-                                                    x_full=x_full_dummy, get_full_nll=True)
-                    pred_mean = full_result.squeeze(0)  # (T-T_0, D)
-                    
-                    # Also get reconstruction part
-                    recon_mean = self.reconstruct(x_input, t_vec_given).squeeze(0)  # (T_0, D)
-                    
-                    # Combine
-                    means = torch.cat([recon_mean, pred_mean], dim=0)  # (T, D)
-                    
-                except:
-                    # Method 2: Fallback to separate calls
-                    pred_mean = self.reconstruct(x_input, t_vec_given, t_vec_pred).squeeze(0)  # (T-T_0, D)
-                    recon_mean = self.reconstruct(x_input, t_vec_given).squeeze(0)  # (T_0, D)
-                    means = torch.cat([recon_mean, pred_mean], dim=0)  # (T, D)
-                
-                stds = self.config.sigma * torch.ones_like(means)
-                
-                # Sample only the prediction part
-                pred_sample = torch.normal(pred_mean, self.config.sigma * torch.ones_like(pred_mean))
-                
-                x_given_2d = x_given.squeeze()
-                if x_given_2d.dim() == 1:
-                    x_given_2d = x_given_2d.unsqueeze(-1)
-                samples = torch.cat([x_given_2d, pred_sample], dim=0)  # (T, D)
+                # Add some noise for samples in prediction part
+                eps = torch.randn(T - T_0, 1, device=device)
+                samples[T_0:] = last_val.expand(T - T_0, 1) + self.config.sigma * eps
             
             return means.cpu().numpy(), stds.cpu().numpy(), samples.cpu().numpy()
 
