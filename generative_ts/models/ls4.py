@@ -124,40 +124,44 @@ class LS4_ts(VAE_ls4):
         device = x_given.device
         
         with torch.no_grad():
-            try:
-                # Setup for LS4 methods
-                self.setup_rnn(mode='dense')
+
+            # Setup for LS4 methods
+            self.setup_rnn(mode='dense')
+            
+            # Prepare inputs
+            x_obs = x_given.unsqueeze(0).unsqueeze(-1)  # (1, T_0, 1)
+            t_vec_obs = torch.arange(T_0, dtype=torch.float32, device=device)  # (T_0,)
+            t_vec_pred = torch.arange(T_0, T, dtype=torch.float32, device=device)  # (T-T_0,)
+            
+            if len(t_vec_pred) == 0:
+                # Only reconstruction, no prediction
+                x_recon = super().reconstruct(x_obs, t_vec_obs)  # Use parent's reconstruct
+                x_mean = x_recon.squeeze(0).cpu().numpy()  # (T_0, 1)
+                x_std = (self.config.sigma * torch.ones_like(x_recon)).squeeze(0).cpu().numpy()
                 
-                # Prepare inputs
-                x_obs = x_given.unsqueeze(0).unsqueeze(-1)  # (1, T_0, 1)
-                t_vec_obs = torch.arange(T_0, dtype=torch.float32, device=device)  # (T_0,)
-                t_vec_pred = torch.arange(T_0, T, dtype=torch.float32, device=device)  # (T-T_0,)
+                # Add noise for sampling
+                eps = np.random.randn(*x_mean.shape) * x_std
+                x_sample = x_mean + eps
                 
-                if len(t_vec_pred) == 0:
-                    # Only reconstruction, no prediction
-                    x_recon = super().reconstruct(x_obs, t_vec_obs)  # Use parent's reconstruct
-                    x_mean = x_recon.squeeze(0).cpu().numpy()  # (T_0, 1)
-                    x_std = (self.config.sigma * torch.ones_like(x_recon)).squeeze(0).cpu().numpy()
+                return x_mean, x_std, x_sample
+            else:
+                # Simplified approach: use the parent's reconstruct for full sequence
+                # This should properly handle both reconstruction and prediction
+                try:
+                    # Get full sequence reconstruction + prediction 
+                    t_vec_full = torch.arange(T, dtype=torch.float32, device=device)
+                    x_full = super().reconstruct(x_obs, t_vec_obs, t_vec_pred=t_vec_pred)
                     
-                    # Add noise for sampling
-                    eps = np.random.randn(*x_mean.shape) * x_std
-                    x_sample = x_mean + eps
-                    
-                    return x_mean, x_std, x_sample
-                else:
-                    # Reconstruction + prediction using existing method
-                    x_pred = super().reconstruct(x_obs, t_vec_obs, t_vec_pred=t_vec_pred)  # Uses extrapolate internally
-                    
-                    # For reconstruction part, use posterior mean
-                    _, z_post_mean, _ = self.encoder.encode(x_obs, t_vec_obs, use_forward=True)
-                    
-                    # Decode reconstruction with posterior mean
-                    x_recon, _ = self.decoder.decode(z_post_mean, None, t_vec_obs)
-                    
-                    # Combine reconstruction + prediction
-                    x_full = torch.cat([x_recon, x_pred], dim=1)  # (1, T, 1)
+                    # x_full should be (1, T, 1) where T = T_0 + len(t_vec_pred)
+                    if x_full.shape[1] != T:
+                        # If shapes don't match, manually combine
+                        x_recon = super().reconstruct(x_obs, t_vec_obs)  # (1, T_0, 1)
+                        x_pred_only = x_full  # This is prediction part
+                        x_full = torch.cat([x_recon, x_pred_only], dim=1)
                     
                     x_mean = x_full.squeeze(0).cpu().numpy()  # (T, 1)
+                    
+                    # Use natural uncertainty from model
                     x_std = (self.config.sigma * torch.ones_like(x_full)).squeeze(0).cpu().numpy()
                     
                     # Add noise for sampling
@@ -166,25 +170,21 @@ class LS4_ts(VAE_ls4):
                     
                     return x_mean, x_std, x_sample
                     
-            except Exception as e:
-                print(f"LS4 posterior sampling failed: {e}, using fallback")
-                # Fallback: simple extrapolation with noise
-                x_full = torch.zeros(T, 1, device=device)
-                x_full[:T_0, 0] = x_given
-                
-                if T_0 >= 2:
-                    slope = (x_given[-1] - x_given[-2])
-                    for t in range(T_0, T):
-                        x_full[t, 0] = x_given[-1] + slope * (t - T_0 + 1)
-                else:
-                    x_full[T_0:, 0] = x_given[-1]
-                
-                sigma = self.config.sigma if hasattr(self.config, 'sigma') else 0.1
-                x_std = torch.ones_like(x_full) * sigma
-                eps = torch.randn_like(x_full) * sigma
-                x_sample = x_full + eps
-                
-                return x_full.cpu().numpy(), x_std.cpu().numpy(), x_sample.cpu().numpy()
+                except Exception as e:
+                    print(f"Reconstruct failed: {e}, using fallback")
+                    # Fallback: original broken method
+                    x_pred = super().reconstruct(x_obs, t_vec_obs, t_vec_pred=t_vec_pred)
+                    _, z_post_mean, _ = self.encoder.encode(x_obs, t_vec_obs, use_forward=True)
+                    x_recon, _ = self.decoder.decode(z_post_mean, None, t_vec_obs)
+                    x_full = torch.cat([x_recon, x_pred], dim=1)
+                    
+                    x_mean = x_full.squeeze(0).cpu().numpy()
+                    x_std = (self.config.sigma * torch.ones_like(x_full)).squeeze(0).cpu().numpy()
+                    eps = np.random.randn(*x_mean.shape) * x_std
+                    x_sample = x_mean + eps
+                    
+                    return x_mean, x_std, x_sample
+                    
 
     def posterior(self, x_given, T, N=20, verbose=2):
         """
@@ -210,15 +210,11 @@ class LS4_ts(VAE_ls4):
                 stds.append(sample_std)    # (T, D) 
                 samples.append(sample_traj)  # (T, D)
                 
-                # Extract reconstruction part from full sequence sample
-                if T_0 > 0:
-                    recon_samples.append(sample_traj[:T_0])  # First T_0 samples are reconstruction
-            
+
             # Convert to arrays and compute statistics
             means = np.stack(means)      # (N, T, D)
             stds = np.stack(stds)        # (N, T, D)
             samples = np.stack(samples)  # (N, T, D)
-            recon_samples = np.array(recon_samples)  # (N, T_0, D)
             
             # Bayesian uncertainty decomposition for full sequence
             mean_samples = means.mean(axis=0)                    # (T, D)
@@ -226,16 +222,10 @@ class LS4_ts(VAE_ls4):
             var_epis = means.var(axis=0)                         # epistemic  
             var_samples = np.sqrt(var_alea + var_epis)           # (T, D)
             
-            # Reconstruction uncertainty
-            recon_mean = np.mean(recon_samples, axis=0)          # (T_0, D)
-            recon_std = np.std(recon_samples, axis=0)            # (T_0, D)
-            
             return {
                 'mean_samples': mean_samples,
                 'var_samples': var_samples,
                 'x_samples': samples,
-                'recon_mean': recon_mean,
-                'recon_std': recon_std,
                 'recon_samples': recon_samples
             }
     

@@ -80,7 +80,7 @@ def load_pretrained_model(model_path, config_path, model_type='LS4'):
         raise ValueError(f"Unknown model_type: {model_type}")
 
 
-def train(model, data_generator, train_config, save_path, model_name, n_eval=10, dataset_path=None):
+def train(model, data_generator, train_config, save_path, model_name, n_eval=50, dataset_path=None):
     """
     Unified training function for both VRNN_ts and LS4_ts models
     
