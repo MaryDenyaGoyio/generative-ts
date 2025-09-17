@@ -14,10 +14,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
-from .dataset.data import GP
 from .eval import plot_posterior, plot_sample
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 
 def load_pretrained_model(model_path, config_path, model_type='LS4'):
@@ -80,210 +80,128 @@ def load_pretrained_model(model_path, config_path, model_type='LS4'):
         raise ValueError(f"Unknown model_type: {model_type}")
 
 
-def train(model, data_generator, train_config, save_path, model_name, n_eval=50, dataset_path=None):
-    """
-    Unified training function for both VRNN_ts and LS4_ts models
-    
-    Args:
-        model: VRNN_ts or LS4_ts instance
-        data_generator: GP instance (can be None if dataset_path is provided)
-        train_config: training configuration dict (can include 'beta' for KL weighting, default=1.0)
-        save_path: directory to save results
-        model_name: 'VRNN' or 'LS4' for logging
-        dataset_path: if provided, load pre-generated dataset from this path instead of generating new data
-    """
-    
-    # Get beta parameter for KL weighting (default=1.0)
+def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T_0_ratio = 1/4):
+
+    # ---------------- 0) beta VAE ----------------   
     beta = train_config.get('beta', 1.0)
-    if beta != 1.0:
-        print(f"🎛️  Using beta={beta} for KL term weighting")
+    if beta != 1.0: print(f"[β-VAE] β = {beta} weight for KL")
     
     def apply_beta_to_kl_loss(loss_dict, beta):
-        """Apply beta weighting to KL terms in loss dictionary"""
-        if beta == 1.0:
-            return loss_dict  # No change needed
-        
+        if beta == 1.0: return loss_dict
         modified_dict = loss_dict.copy()
         for key, value in loss_dict.items():
             if 'kl' in key.lower() or 'kld' in key.lower():
-                if isinstance(value, torch.Tensor):
-                    modified_dict[key] = value * beta
-                else:
-                    modified_dict[key] = value * beta  # float case
-        
+                if isinstance(value, torch.Tensor): modified_dict[key] = value * beta
+                else:   modified_dict[key] = value * beta
         return modified_dict
     
-    # Generate or load dataset
-    if dataset_path is not None:
-        print(f"Loading pre-generated dataset from: {dataset_path}")
-        # Load samples
-        samples_path = os.path.join(dataset_path, "samples.npy")
-        if not os.path.exists(samples_path):
-            raise FileNotFoundError(f"Dataset file not found: {samples_path}")
-        
-        Y_N_full = np.load(samples_path)  # (N_total, T)
-        
-        # Load config to verify compatibility
-        config_path = os.path.join(dataset_path, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                dataset_config = json.load(f)
-            print(f"Dataset config: T={dataset_config['data']['T']}, total_samples={dataset_config['n_samples']}")
-        
-        # Sample requested number of sequences
-        num_sequences = train_config['num_sequences']
-        if num_sequences > Y_N_full.shape[0]:
-            print(f"Warning: Requested {num_sequences} sequences but dataset only has {Y_N_full.shape[0]}. Using all available.")
-            num_sequences = Y_N_full.shape[0]
-        
-        # Random sampling from dataset
-        indices = np.random.choice(Y_N_full.shape[0], size=num_sequences, replace=False)
-        Y_N = Y_N_full[indices]  # (num_sequences, T)
-        
-        Y_N = torch.from_numpy(Y_N).float()  # (N, T)
-        print(f"Loaded {Y_N.shape[0]} sequences of length {Y_N.shape[1]} from pre-generated dataset")
-        
-    else:
-        print(f"Generating {train_config['num_sequences']} GP sequences for {model_name}...")
-        Y_N = []
-        for _ in range(train_config['num_sequences']):
-            Y, _ = data_generator.data()
-            Y_N.append(Y.squeeze())  # (T,)
-        
-        Y_N = torch.from_numpy(np.stack(Y_N, axis=0)).float()  # (N, T)
+
+    # ---------------- 1) load data ---------------- 
+    print(f"[Load data] {dataset_path}")
+
+    samples_path = os.path.join(dataset_path, "samples.npy")
+    if not os.path.exists(samples_path):    raise FileNotFoundError(f"Not found: {samples_path}")
     
-    # Create dataloader
+    Y_N_full = np.load(samples_path)
+
+    config_path = os.path.join(dataset_path, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            dataset_config = json.load(f)
+        print(f"[Data config]: T = {dataset_config['data']['T']}, N_data = {dataset_config['n_samples']}")
+    
+    
+    # ---------------- 2) train cfg ---------------- 
+    num_sequences = train_config['num_sequences']
+    if num_sequences > Y_N_full.shape[0]:
+        print(f"Warning: N_train = {num_sequences} > N_data = {Y_N_full.shape[0]}. Using only N_data.")
+        num_sequences = Y_N_full.shape[0]
+    
+    indices = np.random.choice(Y_N_full.shape[0], size=num_sequences, replace=False)
+    Y_N = Y_N_full[indices]
+    
+    Y_N = torch.from_numpy(Y_N).float()  # (N, T, D)
+    if Y_N.dim() == 2:  Y_N, D = Y_N.unsqueeze(-1), 1 # (N, T) -> (N, T, 1)
+    else:   D = Y_N.shape[-1] # (N, T, D)
+    
+    N, T, D = Y_N.shape
+    print(f"[Train config]: N_train = {N}, T = {T}, D = {D}")
+    
     loader = DataLoader(TensorDataset(Y_N), 
                        batch_size=train_config['batch_size'], 
                        shuffle=True, 
                        num_workers=4)
     
-    # Create optimizer
     optimizer = torch.optim.Adam(model.parameters(), 
                                 lr=train_config['learning_rate'])
     
-    # Prepare test data
-    if dataset_path is not None:
-        # Use one sample from loaded dataset for testing
-        test_data = Y_N[0:1].numpy()  # (1, T)
-        x_test = torch.from_numpy(test_data.squeeze()).float().to(DEVICE)  # (T,)
-    else:
-        test_data, _ = data_generator.data()
-        x_test = torch.from_numpy(test_data.squeeze()).float().to(DEVICE)  # (T,)
+    test_data = Y_N[0:1].numpy()  # (1, T, D)
+    x_test = torch.from_numpy(test_data.squeeze(0)).float().to(DEVICE)  # (T, D)
+
+    T, T_0 = x_test.shape[0], int(T * T_0_ratio)
     
-    t_0 = len(x_test) // 4
-    T = len(x_test)
     
-    # For LS4: prepare timepoints  
+    # ---------------- 3) load model ----------------  
     base_model_name = model_name.split('_')[0]
     if base_model_name == 'LS4':
         timepoints = torch.linspace(0.0, 1.0, T, device=DEVICE)
     
-    print(f"number of model parameters: {sum(p.numel() for p in model.parameters())}")
+    print(f"[model config]: {model_name}, num_params = {sum(p.numel() for p in model.parameters())}")
     
-    # Training mode message
-    print(f"🚀 TRAINING: Full ELBO training")
+
+
+    # ================= 4) Training =================  
+    print(f"\n===============================================================")
+    print(f"=======================     Training     =======================")
+    print(f"================================================================\n")
     
-    # Training loop
     all_losses = {}
     
-    for epoch in trange(train_config['n_epochs'], desc=f"Training {model_name}", unit="epoch"):
+    for epoch in trange(train_config['n_epochs'], desc=f"[{model_name}]", unit="epoch"):
         start = time.time()
         
-        # Initialize epoch losses
         for k, v in all_losses.items():
             v.append(0)
         
         num_batches = len(loader)
         
-        # Training step
-        model.train()
+        model.train() # <-> eval
+
         for batch_idx, (data,) in enumerate(loader):
-            
             optimizer.zero_grad()
-            
-            # Model-specific forward pass
-            # Handle Phase 2 model names (e.g., 'LS4_Phase2' -> 'LS4')
-            base_model_name = model_name.split('_')[0]
-            
+
+            # ---------------- 4-1) VRNN ----------------  
+            # VRNN expects (T, B, D) - data is (B, T, D) format
+
             if base_model_name == 'VRNN':
-                # VRNN expects (T, B, D) where D=1 for our 1D time series
-                data = data.to(DEVICE).unsqueeze(-1)  # (B, T) -> (B, T, 1)
-                data = data.transpose(0, 1)  # (B, T, 1) -> (T, B, 1)
+                data = data.to(DEVICE)  # (B, T, D)
+                data = data.transpose(0, 1)  # (B, T, D) -> (T, B, D)
                 loss_dict = model(data)
                 
-                # Apply beta weighting to KL terms
                 loss_dict = apply_beta_to_kl_loss(loss_dict, beta)
                 
-                # Use full loss (with beta-weighted KL terms)
                 if 'total_loss' in loss_dict:
                     train_loss = loss_dict['total_loss']
                 else:
                     train_loss = sum(v for v in loss_dict.values() if isinstance(v, torch.Tensor))
-                
+            
+            # ---------------- 4-2) LS4 ----------------  
+            # LS4 expects (B, T, D) - data is already in this format
+
             elif base_model_name == 'LS4':
-                data = data.to(DEVICE).unsqueeze(-1)  # (B, T) -> (B, T, 1)
-                
-                # FIXED: Train with partial observation using masking
-                # This forces the model to learn temporal dynamics for extrapolation
-                T_full = data.shape[1]
-                T_given = int(0.75 * T_full)  # first 75% observed, last 25% to predict
-                
-                # Create masks: 1 for observed, 0 for unobserved (to be predicted)
-                masks = torch.ones_like(data, device=DEVICE)  # (B, T, 1)
-                masks[:, T_given:] = 0.0  # mask out future part during training
-                
-                # Train model to reconstruct full sequence from partial observation
+                data = data.to(DEVICE)  # (B, T, D)
+                masks = torch.zeros_like(data, device=DEVICE)  # (B, T, D)
+
                 train_loss, loss_dict = model(data, timepoints, masks, plot=False, sum=True)
                 
-                # Apply beta weighting to KL terms in loss_dict for logging
                 loss_dict = apply_beta_to_kl_loss(loss_dict, beta)
-                
-                # Recalculate train_loss with beta-weighted KL terms
-                if 'kld_loss' in loss_dict and beta != 1.0:
-                    # Get individual loss components
-                    nll_loss = loss_dict.get('nll_loss', 0)
-                    mse_loss = loss_dict.get('mse_loss', 0)
-                    kld_loss_weighted = loss_dict['kld_loss']  # Already beta-weighted
-                    
-                    # Convert to float values for reconstruction
-                    if isinstance(nll_loss, torch.Tensor):
-                        nll_val = nll_loss.item() if nll_loss.numel() == 1 else nll_loss.mean().item()
-                    else:
-                        nll_val = float(nll_loss)
-                    
-                    if isinstance(mse_loss, torch.Tensor):
-                        mse_val = mse_loss.item() if mse_loss.numel() == 1 else mse_loss.mean().item()
-                    else:
-                        mse_val = float(mse_loss)
-                    
-                    if isinstance(kld_loss_weighted, torch.Tensor):
-                        kld_val = kld_loss_weighted.item() if kld_loss_weighted.numel() == 1 else kld_loss_weighted.mean().item()
-                    else:
-                        kld_val = float(kld_loss_weighted)
-                    
-                    # Reconstruct total loss with beta-weighted KL
-                    total_loss_val = nll_val + mse_val + kld_val
-                    train_loss = torch.tensor(total_loss_val, device=DEVICE, requires_grad=True)
-                    
-                    # Update loss_dict with recalculated total loss
-                    loss_dict['loss'] = total_loss_val
-                    # Add extrapolation-specific loss if available
-                    if hasattr(model, 'extrapolate_loss'):
-                        data_given = data[:, :T_given]  # (B, T_given, 1)
-                        timepoints_given = timepoints[:T_given]
-                        timepoints_pred = timepoints[T_given:]
-                        
-                        extrap_loss = model.extrapolate_loss(data_given, timepoints_given, 
-                                                           timepoints_pred, data[:, T_given:])
-                        train_loss = train_loss + extrap_loss
             
             else:
                 raise ValueError(f"Unknown base_model_name: {base_model_name} (from model_name: {model_name})")
             
             train_loss.backward()
             
-            # Gradient clipping for stability
+            # Grad clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             # NaN/Inf handling
@@ -295,7 +213,8 @@ def train(model, data_generator, train_config, save_path, model_name, n_eval=50,
             
             optimizer.step()
             
-            # Loss logging
+
+        # ---------------- 5-1) Loss logging ----------------  
             for name, each_loss in loss_dict.items():
 
                 if name.endswith("loss"):
@@ -312,151 +231,141 @@ def train(model, data_generator, train_config, save_path, model_name, n_eval=50,
         
         elapsed = time.time() - start
         
-        # Epoch logging
         log_msg = f"[{epoch}/{train_config['n_epochs']}] " + \
                  "\t".join(f"{k}:{v[epoch]:.2f}" for k, v in all_losses.items()) + \
                  f"  epoch: {elapsed:.2f}s"
         tqdm.write(log_msg)
         
-        # Save checkpoints and plots every 10 epochs
+        
+        # ---------------- 5-2) Model save ----------------  
+
         if epoch % n_eval == 0:
-            # Save model
             tqdm.write(f"[{epoch // n_eval}/{train_config['n_epochs'] // n_eval}]", end=" | ")
             start = time.time()
 
             torch.save(model.state_dict(), 
                       os.path.join(save_path, f"model_{model_name}.pth"))
             
-            # Loss plot - filter to show only desired losses
-            desired_losses = ['kld_loss', 'nll_loss']  # KLD, NLL (components of total)
-            loss_keys = [key for key in desired_losses if key in all_losses and len(all_losses[key]) > 0]
+            # 5-2-1) Loss curve
+            plot_loss(all_losses, save_path, model_name)
             
-            if len(loss_keys) > 0:
-                # 2x3 layout: Total Loss + Individual component losses
-                fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-                
-                # Define colors for consistency
-                colors = {'kld_loss': 'red', 'nll_loss': 'green'}
-                labels = {'kld_loss': 'KLD', 'nll_loss': 'NLL'}
-                
-                recent_start = max(0, len(all_losses[loss_keys[0]]) - 100)
-                
-                # Row 0: All epochs
-                # First subplot: Total Loss (showing KLD + NLL components)
-                ax = axes[0, 0]
-                for key in loss_keys:
-                    color = colors.get(key, 'black')
-                    label = labels.get(key, key)
-                    ax.plot(all_losses[key], color=color, label=label, linewidth=2)
-                ax.set_xlabel('epoch')
-                ax.set_ylabel('loss')
-                ax.set_title('Total Loss (Components) - All Epochs')
-                ax.legend()
-                ax.grid(True)
-                
-                # Individual component plots (All epochs)
-                for i, key in enumerate(loss_keys):
-                    if i < 2:  # KLD and NLL
-                        ax = axes[0, i + 1]
-                        color = colors.get(key, 'black')
-                        title = labels.get(key, key)
-                        ax.plot(all_losses[key], color=color, linewidth=2)
-                        ax.set_xlabel('epoch')
-                        ax.set_ylabel('loss')
-                        ax.set_title(f'{title} Loss - All Epochs')
-                        ax.grid(True)
-                
-                # Row 1: Recent 100 epochs
-                # Total Loss (Recent 100)
-                ax = axes[1, 0]
-                for key in loss_keys:
-                    color = colors.get(key, 'black')
-                    label = labels.get(key, key)
-                    recent_vals = all_losses[key][recent_start:]
-                    ax.plot(range(recent_start, len(all_losses[key])), recent_vals, 
-                           color=color, label=label, linewidth=2)
-                ax.set_xlabel('epoch')
-                ax.set_ylabel('loss')
-                ax.set_title('Total Loss (Components) - Recent 100 Epochs')
-                ax.legend()
-                ax.grid(True)
-                
-                # Individual component plots (Recent 100)
-                for i, key in enumerate(loss_keys):
-                    if i < 2:  # KLD and NLL
-                        ax = axes[1, i + 1]
-                        color = colors.get(key, 'black')
-                        title = labels.get(key, key)
-                        recent_vals = all_losses[key][recent_start:]
-                        ax.plot(range(recent_start, len(all_losses[key])), recent_vals,
-                               color=color, linewidth=2)
-                        ax.set_xlabel('epoch')
-                        ax.set_ylabel('loss')
-                        ax.set_title(f'{title} Loss - Recent 100 Epochs')
-                        ax.grid(True)
-                
-                plt.tight_layout()
-                plt.savefig(os.path.join(save_path, f"loss_{model_name}.png"))
-                plt.close()
-            
-            # Posterior plot using model's posterior method
+            # 5-2-2) Posterior plot
             plot_posterior(model, save_path, epoch, model_name=model_name, 
                          dataset_path=dataset_path)
             
-            # Prior/Posterior diagnostic plot
+            # 5-2-3) Loss analysis
             diagnostic_save_path = os.path.join(save_path, "pred")
             plot_sample(model, diagnostic_save_path, epoch, model_name=model_name, 
                        dataset_path=dataset_path)
             
             elapsed = time.time() - start
-            # 뭐 이 자리에 나중에 loss도 출력할지도?
             tqdm.write(f"eval: {elapsed:.2f}s")
     
     return model
 
 
-def train_model(config: Dict[str, Any]) -> nn.Module:
+def plot_loss(all_losses, save_path, model_name):
     """
-    통합된 훈련 함수
-    
+    Plot loss curves (KLD and NLL components)
+
     Args:
-        config: 훈련 설정 딕셔너리
-            - model_type: 'VRNN' or 'LS4'
-            - data: GP 파라미터
-            - model: 모델별 파라미터
-            - train: 훈련 파라미터
+        all_losses: dictionary containing loss history
+        save_path: directory to save the plot
+        model_name: name of the model for filename
     """
+    desired_losses = ['kld_loss', 'nll_loss']  # KLD, NLL (components of total)
+    loss_keys = [key for key in desired_losses if key in all_losses and len(all_losses[key]) > 0]
+
+    if len(loss_keys) > 0:
+        # 2x3 layout: Total Loss + Individual component losses
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+
+        # Define colors for consistency
+        colors = {'kld_loss': 'red', 'nll_loss': 'green'}
+        labels = {'kld_loss': 'KLD', 'nll_loss': 'NLL'}
+
+        recent_start = max(0, len(all_losses[loss_keys[0]]) - 100)
+
+        # Row 0: All epochs
+        # First subplot: Total Loss (showing KLD + NLL components)
+        ax = axes[0, 0]
+        for key in loss_keys:
+            color = colors.get(key, 'black')
+            label = labels.get(key, key)
+            ax.plot(all_losses[key], color=color, label=label, linewidth=2)
+        ax.set_xlabel('epoch')
+        ax.set_ylabel('loss')
+        ax.set_title('Total Loss (Components) - All Epochs')
+        ax.legend()
+        ax.grid(True)
+
+        # Individual component plots (All epochs)
+        for i, key in enumerate(loss_keys):
+            if i < 2:  # KLD and NLL
+                ax = axes[0, i + 1]
+                color = colors.get(key, 'black')
+                title = labels.get(key, key)
+                ax.plot(all_losses[key], color=color, linewidth=2)
+                ax.set_xlabel('epoch')
+                ax.set_ylabel('loss')
+                ax.set_title(f'{title} Loss - All Epochs')
+                ax.grid(True)
+
+        # Row 1: Recent 100 epochs
+        # Total Loss (Recent 100)
+        ax = axes[1, 0]
+        for key in loss_keys:
+            color = colors.get(key, 'black')
+            label = labels.get(key, key)
+            recent_vals = all_losses[key][recent_start:]
+            ax.plot(range(recent_start, len(all_losses[key])), recent_vals,
+                   color=color, label=label, linewidth=2)
+        ax.set_xlabel('epoch')
+        ax.set_ylabel('loss')
+        ax.set_title('Total Loss (Components) - Recent 100 Epochs')
+        ax.legend()
+        ax.grid(True)
+
+        # Individual component plots (Recent 100)
+        for i, key in enumerate(loss_keys):
+            if i < 2:  # KLD and NLL
+                ax = axes[1, i + 1]
+                color = colors.get(key, 'black')
+                title = labels.get(key, key)
+                recent_vals = all_losses[key][recent_start:]
+                ax.plot(range(recent_start, len(all_losses[key])), recent_vals,
+                       color=color, linewidth=2)
+                ax.set_xlabel('epoch')
+                ax.set_ylabel('loss')
+                ax.set_title(f'{title} Loss - Recent 100 Epochs')
+                ax.grid(True)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, f"loss_{model_name}.png"))
+        plt.close()
+
+
+def train_model(config: Dict[str, Any]) -> nn.Module:
+
     
-    # Create save directory
+    # ---------------- 1) get config ----------------  
+    # 1-1) get timestamp
     timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
     save_path = os.path.join("generative_ts/saves", timestamp)
     os.makedirs(save_path, exist_ok=True)
     os.makedirs(os.path.join(save_path, "pred"), exist_ok=True)
     
-    # Save config
+    # 1-2) save config
     with open(os.path.join(save_path, "config.json"), 'w') as f:
         json.dump(config, f, indent=2)
     
-    # Save yaml config if specified
     if 'model' in config and 'config_path' in config['model']:
         yaml_config_path = config['model']['config_path']
         if os.path.exists(yaml_config_path):
             import shutil
             shutil.copy2(yaml_config_path, os.path.join(save_path, "ls4_config.yaml"))
     
-    # Create data generator
-    data_config = config['data']
-    
-    # Determine data generator type based on config
-    if 'phi' in data_config:
-        # AR1 data
-        from .dataset.data import AR1
-        data_generator = AR1(**data_config)
-    else:
-        # GP data
-        data_generator = GP(**data_config)
-    
-    # Create model
+    # ---------------- 2) make model ---------------- 
     model_type = config['model_type']
     model_config = config['model']
     train_config = config['train']
@@ -492,11 +401,13 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    # Check if dataset_path is specified in config
-    dataset_path = config.get('dataset_path', None)
+    # dataset_path is required
+    dataset_path = config.get('dataset_path')
+    if dataset_path is None:
+        raise ValueError("dataset_path must be specified in config")
     
     # Train model using unified train function
-    model = train(model, data_generator, train_config, save_path, model_type, dataset_path=dataset_path)
+    model = train(model, train_config, save_path, model_type, dataset_path)
     
     print(f"Training completed! Results saved to: {save_path}")
     return model

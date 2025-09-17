@@ -1,0 +1,22 @@
+{
+  "model_type": "VRNN",
+  "dataset_path": "generative_ts/dataset/ar1_samples_T300_phi0.9_sigma0.1_stdY0.01",
+  "data": {
+    "T": 300,
+    "phi": 0.9,
+    "sigma": 0.1,
+    "std_Y": 0.01
+  },
+  "model": {
+    "z_dim": 1,
+    "h_dim": 10,
+    "n_layers": 1,
+    "lmbd": 0
+  },
+  "train": {
+    "num_sequences": 50,
+    "batch_size": 10,
+    "n_epochs": 50,
+    "learning_rate": 0.0005
+  }
+}

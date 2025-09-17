@@ -29,6 +29,7 @@ class VRNN_ts(VRNN):
         self.lmbd = lmbd  # entropy regularization weight
         self.std_Y = std_Y  # fixed observation noise
         self.verbose = verbose
+        self.device = DEVICE  # Add device attribute
     
     def forward(self, x):
         """
@@ -134,6 +135,46 @@ class VRNN_ts(VRNN):
         
         return np.array(means), np.array(stds), np.array(samples)
 
+    def _sample_reconstruction(self, x_given):
+        """
+        Sample reconstruction of the given observations using encoder.
+        
+        Args:
+            x_given: observed data (T_0, 1, D)
+        
+        Returns:
+            reconstruction sample (T_0, D)
+        """
+        x_given = x_given.to(self.device)
+        T_0, batch_size, x_dim = x_given.size()
+        
+        with torch.no_grad():
+            # Initialize hidden state with correct dimensions: (n_layers, batch_size, h_dim)
+            h = torch.zeros(self.n_layers, batch_size, self.h_dim, device=self.device)
+            reconstructions = []
+            
+            for t in range(T_0):
+                x_t = x_given[t]  # (batch_size, D)
+                
+                # Encode (same as forward method)
+                phi_x_t = self.phi_x(x_t)
+                enc_t = self.enc(torch.cat([phi_x_t, h[-1]], 1))
+                enc_mean_t = self.enc_mean(enc_t)
+                enc_std_t = self.enc_std(enc_t)
+                z_t = self._reparameterized_sample(enc_mean_t, enc_std_t)
+                
+                # Reconstruct (decode) - use our custom decoder
+                x_mean = z_t
+                x_std = torch.ones_like(x_mean) * torch.tensor(self.std_Y, device=x_mean.device, dtype=x_mean.dtype)
+                x_recon = self._reparameterized_sample(x_mean, x_std)
+                
+                # Update RNN state (same as forward method)
+                phi_z_t = self.phi_z(z_t)
+                _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
+                
+                reconstructions.append(x_recon.squeeze().cpu().numpy())
+        
+        return np.array(reconstructions)
 
     def posterior(self, x_given, T, N=20, verbose=2):
         """

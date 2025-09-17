@@ -1,0 +1,15 @@
+{
+  "model_type": "LS4",
+  "dataset_path": "generative_ts/dataset/ar1_samples_T300_phi0.9_sigma1.0_stdY0.01",
+  "model": {
+    "config_path": "generative_ts/config/ls4_config2.yaml",
+    "z_dim": 1
+  },
+  "train": {
+    "num_sequences": 50,
+    "batch_size": 10,
+    "n_epochs": 300,
+    "learning_rate": 0.001,
+    "beta": 1
+  }
+}
