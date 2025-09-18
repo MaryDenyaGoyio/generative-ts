@@ -185,7 +185,7 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
                 else:
                     train_loss = sum(v for v in loss_dict.values() if isinstance(v, torch.Tensor))
             
-            # ---------------- 4-2) LS4 ----------------  
+            # ---------------- 4-2) LS4 ----------------
             # LS4 expects (B, T, D) - data is already in this format
 
             elif base_model_name == 'LS4':
@@ -193,9 +193,47 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
                 masks = torch.zeros_like(data, device=DEVICE)  # (B, T, D)
 
                 train_loss, loss_dict = model(data, timepoints, masks, plot=False, sum=True)
-                
+
                 loss_dict = apply_beta_to_kl_loss(loss_dict, beta)
-            
+
+            # ---------------- 4-3) LatentODE ----------------
+            # LatentODE expects batch_dict format - use existing compute_all_losses
+
+            elif base_model_name == 'LatentODE':
+                data = data.to(DEVICE)  # (B, T, D)
+                batch_size, seq_len, x_dim = data.shape
+
+                timepoints = torch.linspace(0, 1, seq_len, device=DEVICE)
+
+                # Create explicit mask for latent_ode
+                masks = torch.ones_like(data, device=DEVICE)  # (B, T, D)
+
+                # LatentODE expects data with concatenated mask: [data, mask]
+                data_with_mask = torch.cat([data, masks], dim=-1)  # (B, T, 2*D)
+
+                # Follow exact latent_ode format with proper mask
+                batch_dict = {
+                    "observed_data": data_with_mask,  # Data with concatenated mask
+                    "observed_tp": timepoints,
+                    "data_to_predict": data_with_mask,
+                    "tp_to_predict": timepoints,
+                    "observed_mask": masks,  # Original mask for likelihood computation
+                    "mask_predicted_data": None,
+                    "labels": None,
+                    "mode": "interpolation"
+                }
+
+                loss_dict = model.compute_all_losses(batch_dict)
+
+                if 'loss' in loss_dict:
+                    train_loss = loss_dict['loss']
+                elif 'likelihood' in loss_dict and 'kl_loss' in loss_dict:
+                    train_loss = -loss_dict['likelihood'] + loss_dict['kl_loss']
+                else:
+                    train_loss = sum(v for v in loss_dict.values() if isinstance(v, torch.Tensor))
+
+                loss_dict = apply_beta_to_kl_loss(loss_dict, beta)
+
             else:
                 raise ValueError(f"Unknown base_model_name: {base_model_name} (from model_name: {model_name})")
             
@@ -250,12 +288,14 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
             plot_loss(all_losses, save_path, model_name)
             
             # 5-2-2) Posterior plot
-            plot_posterior(model, save_path, epoch, model_name=model_name, 
-                         dataset_path=dataset_path)
+            posterior_save_path = os.path.join(save_path, "post")
+            N_samples_plot = 1000 if epoch % 100 == 0 and epoch > 0 else 100
+            plot_posterior(model, posterior_save_path, epoch, model_name=model_name,
+                         dataset_path=dataset_path, N_samples=N_samples_plot)
             
             # 5-2-3) Loss analysis
-            diagnostic_save_path = os.path.join(save_path, "pred")
-            plot_sample(model, diagnostic_save_path, epoch, model_name=model_name, 
+            analysis_save_path = os.path.join(save_path, "anl")
+            plot_sample(model, analysis_save_path, epoch, model_name=model_name, 
                        dataset_path=dataset_path)
             
             elapsed = time.time() - start
@@ -273,7 +313,8 @@ def plot_loss(all_losses, save_path, model_name):
         save_path: directory to save the plot
         model_name: name of the model for filename
     """
-    desired_losses = ['kld_loss', 'nll_loss']  # KLD, NLL (components of total)
+    # Support both naming conventions for compatibility
+    desired_losses = ['kl_loss', 'kld_loss', 'nll_loss']  # KL, NLL (components of total)
     loss_keys = [key for key in desired_losses if key in all_losses and len(all_losses[key]) > 0]
 
     if len(loss_keys) > 0:
@@ -281,8 +322,8 @@ def plot_loss(all_losses, save_path, model_name):
         fig, axes = plt.subplots(2, 3, figsize=(15, 8))
 
         # Define colors for consistency
-        colors = {'kld_loss': 'red', 'nll_loss': 'green'}
-        labels = {'kld_loss': 'KLD', 'nll_loss': 'NLL'}
+        colors = {'kl_loss': 'red', 'kld_loss': 'red', 'nll_loss': 'green'}
+        labels = {'kl_loss': 'KL', 'kld_loss': 'KL', 'nll_loss': 'NLL'}
 
         recent_start = max(0, len(all_losses[loss_keys[0]]) - 100)
 
@@ -353,7 +394,8 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
     timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
     save_path = os.path.join("generative_ts/saves", timestamp)
     os.makedirs(save_path, exist_ok=True)
-    os.makedirs(os.path.join(save_path, "pred"), exist_ok=True)
+    os.makedirs(os.path.join(save_path, "anl"), exist_ok=True)
+    os.makedirs(os.path.join(save_path, "post"), exist_ok=True)
     
     # 1-2) save config
     with open(os.path.join(save_path, "config.json"), 'w') as f:
@@ -397,7 +439,26 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
         model = LS4_ts(ls4_config).to(DEVICE)
         # Setup RNN for inference/generation
         model.setup_rnn(mode='dense')
-        
+
+    elif model_type == 'LatentODE':
+        from .models.latent_ode import LatentODE_ts
+
+        class Config:
+            pass
+
+        config_obj = Config()
+        config_obj.x_dim = 1
+        config_obj.z_dim = model_config.get('latent_dim', 6)
+        config_obj.std_Y = model_config.get('obsrv_std', 0.01)
+        config_obj.rec_dims = model_config.get('rec_dims', 20)
+        config_obj.rec_layers = model_config.get('rec_layers', 1)
+        config_obj.gen_layers = model_config.get('gen_layers', 1)
+        config_obj.units = model_config.get('units', 100)
+        config_obj.gru_units = model_config.get('gru_units', 100)
+        config_obj.z0_encoder = model_config.get('z0_encoder', 'odernn')
+
+        model = LatentODE_ts(config_obj).to(DEVICE)
+
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     

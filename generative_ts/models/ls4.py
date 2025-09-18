@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
-# LS4 imports for overrides
 from ls4.models.ls4 import VAE as VAE_ls4
 from ls4.models.ls4 import Decoder as Decoder_ls4
 

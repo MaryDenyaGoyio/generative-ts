@@ -1,13 +1,4 @@
-250809 할 일
+250918
 
-2) 모델 파라미터 수 저장 : 난이도 0
-
-5) params 저장 형식 변화 env와 mdl을 분리 : 난이도 4
-
-7) CUDA extension 문제 (기존 cuda는 꼭 복사하기) : 난이도 1.5
-
-8) 실험용과 실제용 data 차원 다르게 설정하기 : 난이도 1
-
-9) 생각보다 GP 데이터 만드는게 시간이 좀 걸리네
-
-10) GP data가 왜 이렇게 생겼지? 특히나 GP posterior가 좀 이상하다
+conda activate latentode
+python run.py generative_ts/config/latentode_experiment.json

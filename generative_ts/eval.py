@@ -6,7 +6,7 @@ import matplotlib.gridspec as gridspec
 from datetime import datetime
 
 
-def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, fixed_sample_idx=None):
+def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, fixed_sample_idx=None, N_samples = 100):
     """
     Plot posterior: p(x_{1:T} | x_{1:t_0})
     Shows full sequence posterior with data, samples, mean, and ±2σ.
@@ -51,7 +51,6 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     T_data = len(y_sample)  # Original data length (e.g., 300)
     t_0 = int(0.4 * T_data)  # 40% for conditioning (e.g., 120)
     T = T_data  # Total horizon = data length (300)
-    N_samples = 10  # Fewer samples for faster plotting
     
     print(f"Sample {idx}: T_data={T_data}, t_0={t_0}, T={T}")
     
@@ -83,8 +82,12 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     
     # Model posterior samples (light gray) - full sequence
     samples = result['x_samples']
-    for i in range(min(5, N_samples)):  # Show only first 5 samples
-        plt.plot(time_steps_full, samples[i].squeeze(), 'lightgray', alpha=0.3, linewidth=0.5)
+    for i in range(min(10, N_samples)):  # Show first 10 samples for better visibility
+        plt.plot(time_steps_full, samples[i].squeeze(), 'red', alpha=0.2, linewidth=0.8)
+
+    # Add sample path label only once (using invisible plot for legend)
+    if N_samples > 0:
+        plt.plot([], [], 'red', alpha=0.2, linewidth=0.8, label=f'Sample Paths (N={min(10, N_samples)})')
     
     # Model posterior mean and ±2σ - full sequence
     mean_traj = result['mean_samples'].squeeze()
@@ -109,7 +112,7 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
             if os.path.isdir(dataset_path):
                 config_file = os.path.join(dataset_path, 'config.json')
             else:
-                config_file = dataset_path.replace('.pth', '_config.json')
+                config_file = os.path.join(os.path.dirname(dataset_path), 'config.json')
             
             if os.path.exists(config_file):
                 ar1_model = AR1_ts(config_path=config_file)
@@ -125,24 +128,24 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
                                 ar1_mean[t_0:] + 2*ar1_std[t_0:], 
                                 alpha=0.2, color='green', label='AR1 True ±2σ')
                 
-                print("Added AR1 theoretical posterior")
+                pass  # AR1 theoretical posterior added silently
         except Exception as e:
             print(f"Could not add AR1 theoretical posterior: {e}")
     
     plt.xlabel('Time')
     plt.ylabel('Value')
-    plt.title('Posterior plot')
+    plt.title(f'Posterior plot_{model_name}_{epoch}_{N_samples}samples')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     
     # Save
     os.makedirs(save_path, exist_ok=True)
-    save_file = os.path.join(save_path, f'posterior_{model_name}_{epoch}.png')
+    save_file = os.path.join(save_path, f'posterior_{model_name}_{epoch}_{N_samples}samples.png')
     plt.savefig(save_file, dpi=150, bbox_inches='tight')
     plt.close()
     
-    print(f"Posterior plot saved: {save_file}")
+    pass  # Posterior plot saved silently
     
 
 def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fixed_sample_idx=None):
@@ -196,7 +199,7 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
     T = len(Y_sample)
     
     print(f"Using dataset sample {idx} with mean={np.mean(Y_sample):.2f}, std={np.std(Y_sample):.2f}")
-    print(f"\n=== Processing {model_name} ===")
+    # Silently process model analysis
     
     # Convert to tensor
     device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
@@ -295,14 +298,91 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                 kl_losses = np.zeros(T)
                 nll_losses = np.full(T, 10)
                 
+        elif 'LatentODE' in model_name:
+            # LatentODE-specific step-by-step processing
+            pass  # Using LatentODE step-by-step analysis
+
+            try:
+                # Prepare data with mask (LatentODE expects data+mask concatenated)
+                x_data = Y_tensor.unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
+                mask_data = torch.ones_like(x_data)  # (1, T, 1)
+                x_with_mask = torch.cat([x_data, mask_data], dim=-1)  # (1, T, 2)
+                time_points = torch.linspace(0, 1, T, device=device)
+
+                # Compute global KL once: KL(q(z_0|x_{1:T}) || p(z_0))
+                z0_mu_full, z0_std_full = model.encoder_z0(x_with_mask, time_points, run_backwards=True)
+                prior_z0_mu = torch.zeros_like(z0_mu_full)
+                prior_z0_std = torch.ones_like(z0_std_full)
+
+                from torch.distributions import Normal, kl_divergence
+                q_z0_full = Normal(z0_mu_full, z0_std_full)
+                p_z0_full = Normal(prior_z0_mu, prior_z0_std)
+                total_kl = kl_divergence(q_z0_full, p_z0_full).mean().item()
+
+                # Sample z_0 from full posterior for trajectory generation
+                z0_sample = z0_mu_full + z0_std_full * torch.randn_like(z0_std_full)
+
+                # Generate full trajectory z_1, ..., z_T from z_0
+                sol_z = model.diffeq_solver(z0_sample, time_points)  # (1, 1, T, latent_dim)
+
+                # Initialize arrays
+                inference_means = np.zeros(T)
+                inference_stds = np.zeros(T)
+                prior_means = np.zeros(T)
+                prior_stds = np.zeros(T)
+                nll_losses = np.zeros(T)
+
+                # KL is constant across time (global nature of LatentODE)
+                kl_losses = np.full(T, total_kl / T)  # Distribute total KL evenly
+
+                # Compute NLL for each timestep
+                for t in range(T):
+                    # Extract z_t
+                    z_t = sol_z[0, 0, t, :]  # (latent_dim,)
+
+                    # Visualization: inference shows z_t projected to x space
+                    inference_means[t] = z_t[:model.x_dim].mean().item()
+                    inference_stds[t] = z0_std_full.mean().item()
+
+                    # Prior: z_0 prior projected through ODE to time t
+                    # For visualization, show effect of prior z_0
+                    prior_z0_sample = torch.randn_like(z0_sample)  # Sample from N(0,1)
+                    prior_sol = model.diffeq_solver(prior_z0_sample, time_points[:t+1])
+                    prior_z_t = prior_sol[0, 0, -1, :]  # Last timestep
+                    prior_means[t] = prior_z_t[:model.x_dim].mean().item()
+                    prior_stds[t] = 1.0  # Prior std
+
+                    # NLL: -log p(x_t | z_t) using custom decoder p(x_t | z_t) = N(z_t[:x_dim], std_Y^2)
+                    x_t_pred = z_t[:model.x_dim]  # First x_dim dimensions as mean
+                    x_t_true = Y_tensor[t]  # Current observation
+
+                    # Gaussian NLL: -log N(x_true | x_pred, std_Y^2)
+                    nll_t = 0.5 * ((x_t_true - x_t_pred) / model.std_Y) ** 2
+                    nll_t += 0.5 * np.log(2 * np.pi * model.std_Y ** 2)
+                    nll_losses[t] = nll_t.item()
+
+                pass  # LatentODE step-by-step analysis completed silently
+
+            except Exception as e:
+                print(f"LatentODE step-by-step analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fallback
+                inference_means = Y_test_np
+                inference_stds = np.full(T, sigma_Y)
+                prior_means = np.zeros(T)
+                prior_stds = np.ones(T)
+                kl_losses = np.zeros(T)
+                nll_losses = np.full(T, 10)
+
         else:
             # VRNN or other model - use model's forward pass
             print("Using VRNN forward pass")
-            
+
             try:
                 # Prepare input for VRNN: (T, 1, D)
                 x_input = Y_tensor.unsqueeze(1).unsqueeze(-1)  # (T, 1, 1)
-                
+
                 # Use VRNN's forward method
                 result = model.forward(x_input)
                 
