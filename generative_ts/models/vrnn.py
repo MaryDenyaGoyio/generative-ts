@@ -205,8 +205,8 @@ class VRNN_ts(VRNN):
             
             for i in range(N):
                 if i % 100 == 0 and verbose > 1:
-                    print(f"Sampling {i}/{N}")
-                
+                    pass  # Remove noisy sampling output
+
                 # Single posterior sample for full sequence
                 sample_mean, sample_std, sample_traj = self.posterior_sample(x_given, T)
                 

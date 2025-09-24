@@ -123,6 +123,8 @@ class LatentODE_ts(LatentODE):
         """
         observed_data_with_mask = batch_dict["observed_data"]  # (B, T, 2*D)
         observed_tp = batch_dict["tp_to_predict"]
+        if hasattr(observed_tp, 'to'):
+            observed_tp = observed_tp.to(self.device)
 
         # Extract original data without mask for likelihood computation
         n_data_dims = observed_data_with_mask.size(-1) // 2

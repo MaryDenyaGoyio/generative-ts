@@ -52,7 +52,7 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     t_0 = int(0.4 * T_data)  # 40% for conditioning (e.g., 120)
     T = T_data  # Total horizon = data length (300)
     
-    print(f"Sample {idx}: T_data={T_data}, t_0={t_0}, T={T}")
+    print(f"Sample {idx}: T_data={T_data}, t_0={t_0}, T={T}, N={N_samples}")
     
     # Get posterior samples
     with torch.no_grad():
@@ -131,13 +131,53 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
                 pass  # AR1 theoretical posterior added silently
         except Exception as e:
             print(f"Could not add AR1 theoretical posterior: {e}")
+
+    # Add GP true posterior if applicable
+    if dataset_path and 'gp' in dataset_path.lower():
+        try:
+            from .dataset.gp import GP_ts
+
+            # Load GP config
+            if os.path.isdir(dataset_path):
+                config_file = os.path.join(dataset_path, 'config.json')
+            else:
+                config_file = os.path.join(os.path.dirname(dataset_path), 'config.json')
+
+            if os.path.exists(config_file):
+                gp_model = GP_ts(config_path=config_file)
+                gp_result = gp_model.posterior(y_sample[:t_0], T, N=1, verbose=0)
+
+                # Handle both numpy arrays and lists
+                gp_mean = gp_result['mean_samples']
+                gp_std = gp_result['var_samples']
+
+                if hasattr(gp_mean, 'squeeze'):
+                    gp_mean = gp_mean.squeeze()
+                    gp_std = gp_std.squeeze()
+                else:
+                    gp_mean = np.array(gp_mean).squeeze()
+                    gp_std = np.array(gp_std).squeeze()
+                
+                # GP true posterior - prediction region only (T_0 onwards)
+                plt.plot(time_steps_prediction, gp_mean[t_0:], 'g--', linewidth=2, label='GP True Mean', alpha=0.8)
+                plt.fill_between(time_steps_prediction, 
+                                gp_mean[t_0:] - 2*gp_std[t_0:], 
+                                gp_mean[t_0:] + 2*gp_std[t_0:], 
+                                alpha=0.2, color='green', label='GP True ±2σ')
+                
+                print("Added GP theoretical posterior")
+        except Exception as e:
+            print(f"Could not add GP theoretical posterior: {e}")
     
     plt.xlabel('Time')
     plt.ylabel('Value')
     plt.title(f'Posterior plot_{model_name}_{epoch}_{N_samples}samples')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass  # Ignore tight_layout warnings
     
     # Save
     os.makedirs(save_path, exist_ok=True)
@@ -198,7 +238,7 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
     Y_sample = Y_test[idx]
     T = len(Y_sample)
     
-    print(f"Using dataset sample {idx} with mean={np.mean(Y_sample):.2f}, std={np.std(Y_sample):.2f}")
+
     # Silently process model analysis
     
     # Convert to tensor
@@ -210,7 +250,6 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
     with torch.no_grad():
         if hasattr(model, 'compute_elbo_terms'):
             # GP_ts model - use actual ELBO computation
-            print("Using GP_ts inference/prior methods")
             
             nll_trajectory, kl_trajectory, theta_values = model.compute_elbo_terms(Y_tensor, return_trajectory=True)
             
@@ -237,7 +276,6 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
             
         elif 'LS4' in model_name:
             # LS4 model - use actual forward pass to get all values
-            print("Using LS4 actual forward pass")
             
             # Prepare input
             x_input = Y_tensor.unsqueeze(0).unsqueeze(-1)  # (1, T, 1)
@@ -284,7 +322,6 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                 kl_losses = np.array(kl_losses)
                 nll_losses = np.array(nll_losses)
                 
-                print(f"LS4 computation successful: KL range [{np.min(kl_losses):.2f}, {np.max(kl_losses):.2f}], NLL range [{np.min(nll_losses):.2f}, {np.max(nll_losses):.2f}]")
                 
             except Exception as e:
                 print(f"LS4 forward pass failed: {e}")
@@ -377,7 +414,6 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
 
         else:
             # VRNN or other model - use model's forward pass
-            print("Using VRNN forward pass")
 
             try:
                 # Prepare input for VRNN: (T, 1, D)
@@ -391,7 +427,6 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                 nll_loss_total = result['nll_loss'].item()  
                 ent_loss_total = result.get('ent_loss', torch.tensor(0.0)).item()
                 
-                print(f"VRNN forward successful: total KL={kl_loss_total:.2f}, total NLL={nll_loss_total:.2f}")
                 
                 # For trajectories, we need step-by-step processing
                 # But use the model's actual methods, not manual calculations
@@ -502,7 +537,10 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
     ax4.grid(True, alpha=0.3)
     ax4.tick_params(axis='both', which='major', labelsize=8)
     
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass  # Ignore tight_layout warnings
     
     # Save
     os.makedirs(save_path, exist_ok=True)

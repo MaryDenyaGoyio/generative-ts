@@ -190,9 +190,10 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
 
             elif base_model_name == 'LS4':
                 data = data.to(DEVICE)  # (B, T, D)
-                masks = torch.zeros_like(data, device=DEVICE)  # (B, T, D)
+                masks = torch.ones_like(data, device=DEVICE)  # (B, T, D)
 
                 train_loss, loss_dict = model(data, timepoints, masks, plot=False, sum=True)
+
 
                 loss_dict = apply_beta_to_kl_loss(loss_dict, beta)
 
@@ -252,7 +253,7 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
             optimizer.step()
             
 
-        # ---------------- 5-1) Loss logging ----------------  
+        # ---------------- 5-1) Loss logging ----------------
             for name, each_loss in loss_dict.items():
 
                 if name.endswith("loss"):
@@ -265,10 +266,17 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
                     else:
                         value = each_loss  # float
 
-                    all_losses.setdefault(name, [0] * (epoch + 1))[epoch] += value / num_batches
+
+                    all_losses.setdefault(name, [0] * (epoch + 1))[epoch] += value
         
         elapsed = time.time() - start
         
+        # Average the accumulated losses over number of batches
+        for loss_name in all_losses:
+            all_losses[loss_name][epoch] /= num_batches
+
+
+
         log_msg = f"[{epoch}/{train_config['n_epochs']}] " + \
                  "\t".join(f"{k}:{v[epoch]:.2f}" for k, v in all_losses.items()) + \
                  f"  epoch: {elapsed:.2f}s"

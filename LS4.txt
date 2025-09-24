@@ -1,0 +1,76 @@
+[Inference (q)]
+
+x (T,B,channel)
+  └─Lin(channel→d_model)──────────────────▶ (T,B,d_model)
+      └─Backbone[d_model→d_model, causal]─▶ (T,B,d_model)
+          ├─head_mu:       Lin(d_model→z_dim)▶ μ_z (T,B,z_dim)
+          └─head_preσ:     Lin(d_model→z_dim)─sp+─▶ σ_z (T,B,z_dim)
+reparam: z = μ_z + σ_z ⊙ ε   (ε ~ N(0,1), same shape)
+
+[Prior (pr)]
+z (T,B,z_dim)
+  └─shift_1step_back───────────────────────▶ z_shifted (T,B,z_dim)   // z_shifted[0]=0, z_shifted[t]=z[t-1]
+      └─Lin(z_dim→d_model)────────────────▶ (T,B,d_model)
+          └─Backbone[d_model→d_model, causal]▶ (T,B,d_model)
+              ├─head_mu:     Lin(d_model→z_dim)▶ μ_p (T,B,z_dim)
+              └─head_preσ:   Lin(d_model→z_dim)─sp▶ σ_p (T,B,z_dim)
+
+[Generation (p)]
+z (T,B,z_dim)
+  └─Lin(z_dim→d_model)────────────────────▶ (T,B,d_model)
+      └─Backbone[d_model→d_model, causal]─▶ (T,B,d_model)
+          └─head_x:       LS4 decoder head──▶ raw_x (T,B,channel)
+μ_x = act(raw_x)                             // act ∈ {identity, tanh, shift, sigmoid} per config
+σ_x = sigma * 1                              // scalar const σ (broadcast → (T,B,channel))
+
+
+
+[S4 Backbone]
+
+In:  X0 (T,B,d_model)
+
+▼ DownPool (채널↑, 길이 동일)
+X1 = LT(d_model→d_model·expand)(X0)                 // (T,B,d_model·expand)
+
+▼ Middle Residual Stack (2·n_layers blocks; 교차 배치, 항상 채널 d_model·expand 유지)
+for k = 1 .. n_layers:
+  // S4 블록 k
+  A  = LN(X1)                                        // (T,B,d_model·expand)
+  A' = S4_conv1d_causal(A)                           // (T,B,d_model·expand)  ← 인과 커널(FFT 적용)
+  A''= Drop(p)(A')                                   // (T,B,d_model·expand)
+  X1 = X1 ⊕ A''                                      // (T,B,d_model·expand)
+
+  // FF 블록 k  (채널 MLP)
+  B  = LN(X1)                                        // (T,B,d_model·expand)
+  B1 = LT(d_model·expand→d_model·expand·ff)(B)       // (T,B,d_model·expand·ff)
+  B2 = GELU(B1)                                      // (T,B,d_model·expand·ff)
+  B3 = Drop(p)(B2)                                   // (T,B,d_model·expand·ff)
+  B4 = LT(d_model·expand·ff→d_model·expand)(B3)      // (T,B,d_model·expand)
+  X1 = X1 ⊕ B4                                       // (T,B,d_model·expand)
+
+▼ UpPool (채널↓, 길이 동일) + Causal Shift
+U0 = LT(d_model·expand→d_model)(X1)                  // (T,B,d_model)
+U1 = causal_shift(U0, k=+1)                          // (T,B,d_model)   ← 한 스텝 "우측으로" 이동해 미래 누설 방지
+
+▼ 출력 정규화
+Out = LN(U1)                                         // (T,B,d_model)
+
+Return Out
+
+
+
+[Heads]
+
+Inference / Prior (split)
+
+H (T,B,d_model)   // Backbone 출력
+μ   = Lin(d_model→z_dim)(H)                   // (T,B,z_dim)
+preσ= Lin(d_model→z_dim)(H)                   // (T,B,z_dim)
+σ   = softplus(preσ) + 1e-5                   // (T,B,z_dim)
+
+Generation (config.act)
+
+H (T,B,d_model)   // Backbone 출력
+raw_x = decoder_head(H)                      // (T,B,channel)
+μ_x   = act(raw_x)                           // act ∈ {identity, tanh, shift, sigmoid}
+σ_x   = sigma * torch.ones_like(μ_x)

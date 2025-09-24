@@ -2,3 +2,8 @@
 
 conda activate latentode
 python run.py generative_ts/config/latentode_experiment.json
+
+
+git add -A
+git commit -m "250918_3"
+git push origin HEAD

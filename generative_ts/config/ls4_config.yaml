@@ -20,7 +20,7 @@ optim:
 
 model:
   sigma: 0.1
-  z_dim: &z_dim 5
+  z_dim: &z_dim 1
   in_channels: *channel
   bidirectional: False
   classifier: False
@@ -32,9 +32,9 @@ model:
     prior:
       d_input: *z_dim #zdim
       aux_channels: 0 #input, will be concatenated to z
-      d_state: 16
+      d_state: 4
       d_output: *z_dim #zdim
-      d_model: 16
+      d_model: 4
       n_layers: 4
       backbone: autoreg
       use_unet: False
@@ -51,9 +51,9 @@ model:
     decoder:
       d_input: *z_dim #zdim
       aux_channels: 0 #input, will be concatenated to z
-      d_state: 16
+      d_state: 4
       d_output: *channel
-      d_model: 16
+      d_model: 4
       n_layers: 4
       backbone: autoreg
       use_unet: False
@@ -73,9 +73,9 @@ model:
     posterior:
       d_input: *channel
       aux_channels: 0
-      d_state: 16
+      d_state: 4
       d_output: *z_dim #zdim
-      d_model: 16
+      d_model: 4
       n_layers: 4
       backbone: autoreg
       use_unet: False

@@ -536,7 +536,17 @@ class GP_ts():
         for t in range(t_obs):
             Y_observed = Y_given[:t+1]
             theta_mean, theta_var = self.inference(Y_observed, t)
-        
+            recon_means.append([theta_mean])  # Shape: (1,)
+            recon_stds.append([np.sqrt(theta_var)])  # Shape: (1,)
+
+        # Convert to numpy arrays
+        if len(recon_means) > 0:
+            recon_means = np.array(recon_means)  # (t_obs, 1)
+            recon_stds = np.array(recon_stds)    # (t_obs, 1)
+        else:
+            recon_means = np.array([]).reshape(0, 1)  # (0, 1)
+            recon_stds = np.array([]).reshape(0, 1)   # (0, 1)
+
         # Combine reconstruction + prediction
         full_mean = np.vstack([recon_means, posterior_mean_pred.reshape(-1, 1)])  # (T, 1)
         full_std = np.vstack([recon_stds, posterior_std_pred.reshape(-1, 1)])    # (T, 1)

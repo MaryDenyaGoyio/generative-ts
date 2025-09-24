@@ -43,22 +43,27 @@ class Decoder_ts(Decoder_ls4):
     
     def __init__(self, config, sigma, z_dim, in_channels, bidirectional):
         super().__init__(config, sigma, z_dim, in_channels, bidirectional)
-        
+
         # Override sigmoid activation to identity
         self.act = nn.Identity()
-        
+
+        # Make sigma a learnable parameter
+        self.log_sigma = nn.Parameter(torch.log(torch.tensor(sigma)))
+
         if z_dim != in_channels:
             self.projection = nn.Linear(z_dim, in_channels)
         else:
             self.projection = None
 
-    def decode(self, z, x, t_vec):  
+    def decode(self, z, x, t_vec):
         if self.projection is not None:
             z_mean = self.projection(z)
         else:
             z_mean = z
-        
-        std = self.sigma * torch.ones_like(z_mean)
+
+        # Use learnable sigma parameter
+        sigma = torch.exp(self.log_sigma)
+        std = sigma * torch.ones_like(z_mean)
         return z_mean, std
 
     def reconstruct(self, x, t_vec, z_post, z_post_back=None):
@@ -136,7 +141,8 @@ class LS4_ts(VAE_ls4):
                 # Only reconstruction, no prediction
                 x_recon = super().reconstruct(x_obs, t_vec_obs)  # Use parent's reconstruct
                 x_mean = x_recon.squeeze(0).cpu().numpy()  # (T_0, 1)
-                x_std = (self.config.sigma * torch.ones_like(x_recon)).squeeze(0).cpu().numpy()
+                sigma = torch.exp(self.decoder.log_sigma)
+                x_std = (sigma * torch.ones_like(x_recon)).squeeze(0).cpu().numpy()
                 
                 # Add noise for sampling
                 eps = np.random.randn(*x_mean.shape) * x_std
@@ -159,9 +165,10 @@ class LS4_ts(VAE_ls4):
                         x_full = torch.cat([x_recon, x_pred_only], dim=1)
                     
                     x_mean = x_full.squeeze(0).cpu().numpy()  # (T, 1)
-                    
-                    # Use natural uncertainty from model
-                    x_std = (self.config.sigma * torch.ones_like(x_full)).squeeze(0).cpu().numpy()
+
+                    # Use learned sigma parameter
+                    sigma = torch.exp(self.decoder.log_sigma)
+                    x_std = (sigma * torch.ones_like(x_full)).squeeze(0).cpu().numpy()
                     
                     # Add noise for sampling
                     eps = np.random.randn(*x_mean.shape) * x_std
@@ -178,7 +185,8 @@ class LS4_ts(VAE_ls4):
                     x_full = torch.cat([x_recon, x_pred], dim=1)
                     
                     x_mean = x_full.squeeze(0).cpu().numpy()
-                    x_std = (self.config.sigma * torch.ones_like(x_full)).squeeze(0).cpu().numpy()
+                    sigma = torch.exp(self.decoder.log_sigma)
+                    x_std = (sigma * torch.ones_like(x_full)).squeeze(0).cpu().numpy()
                     eps = np.random.randn(*x_mean.shape) * x_std
                     x_sample = x_mean + eps
                     
@@ -199,8 +207,8 @@ class LS4_ts(VAE_ls4):
             
             for i in range(N):
                 if i % 100 == 0 and verbose > 1:
-                    print(f"Sampling {i}/{N}")
-                
+                    pass  # Remove noisy sampling output
+
                 # Single posterior sample for full sequence
                 sample_mean, sample_std, sample_traj = self.posterior_sample(x_given, T)
                 

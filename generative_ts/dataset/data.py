@@ -176,9 +176,17 @@ def generate_gp_dataset(config_path, n_samples=10000, save_dir=None):
     with open(save_dir / "original_experiment_config.json", 'w') as f:
         json.dump(config, f, indent=2)
     
+    # Create test/train split (same format as AR1)
+    data_dict = {
+        'Y_test': samples.tolist(),
+        'config': {"data": data_config}
+    }
+    torch.save(data_dict, save_dir / "data.pth")
+
     print(f"✅ Dataset generated successfully!")
     print(f"   Samples: {save_dir}/samples.npy")
     print(f"   Config: {save_dir}/config.json")
+    print(f"   Data: {save_dir}/data.pth")
     print(f"   Original config: {save_dir}/original_experiment_config.json")
     
     return save_dir, samples
