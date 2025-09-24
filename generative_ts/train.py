@@ -80,7 +80,7 @@ def load_pretrained_model(model_path, config_path, model_type='LS4'):
         raise ValueError(f"Unknown model_type: {model_type}")
 
 
-def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T_0_ratio = 1/4):
+def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T_0_ratio = 1/4, resume_info=None, start_epoch=0):
 
     # ---------------- 0) beta VAE ----------------   
     beta = train_config.get('beta', 1.0)
@@ -132,9 +132,24 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
                        shuffle=True, 
                        num_workers=4)
     
-    optimizer = torch.optim.Adam(model.parameters(), 
+    optimizer = torch.optim.Adam(model.parameters(),
                                 lr=train_config['learning_rate'])
-    
+
+    # Load optimizer and scheduler state if resuming
+    scheduler = None
+    if resume_info is not None:
+        if resume_info.get('optimizer_state') is not None:
+            optimizer.load_state_dict(resume_info['optimizer_state'])
+            print(f"🔄 Optimizer state restored")
+        if resume_info.get('scheduler_state') is not None:
+            # Create scheduler if it was used before
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.9)
+            scheduler.load_state_dict(resume_info['scheduler_state'])
+            print(f"🔄 Scheduler state restored")
+
+        # Model state is already loaded in resume_training_setup
+        print(f"🔄 Model weights already loaded from checkpoint")
+
     test_data = Y_N[0:1].numpy()  # (1, T, D)
     x_test = torch.from_numpy(test_data.squeeze(0)).float().to(DEVICE)  # (T, D)
 
@@ -156,12 +171,26 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
     print(f"================================================================\n")
     
     all_losses = {}
-    
-    for epoch in trange(train_config['n_epochs'], desc=f"[{model_name}]", unit="epoch"):
+
+    # Load existing loss history if resuming
+    if resume_info is not None:
+        loss_history_path = os.path.join(save_path, "loss_history.json")
+        if os.path.exists(loss_history_path):
+            with open(loss_history_path, 'r') as f:
+                all_losses = json.load(f)
+            print(f"🔄 Loaded loss history with {len(list(all_losses.values())[0]) if all_losses else 0} epochs")
+
+    # Training loop: continue from start_epoch + 1 if resuming, 0 if new training
+    actual_start = start_epoch + 1 if resume_info else start_epoch
+    total_epochs = actual_start + train_config['n_epochs']
+    for epoch in trange(actual_start, total_epochs, desc=f"[{model_name}]", unit="epoch", initial=actual_start, total=total_epochs):
         start = time.time()
         
+        # Initialize loss entries for this epoch if needed
+        current_epoch_idx = epoch - start_epoch
         for k, v in all_losses.items():
-            v.append(0)
+            while len(v) <= current_epoch_idx + start_epoch:
+                v.append(0)
         
         num_batches = len(loader)
         
@@ -267,7 +296,12 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
                         value = each_loss  # float
 
 
-                    all_losses.setdefault(name, [0] * (epoch + 1))[epoch] += value
+                    # Initialize loss list to proper size if needed
+                    if name not in all_losses:
+                        all_losses[name] = [0] * (epoch + 1)
+                    elif len(all_losses[name]) <= epoch:
+                        all_losses[name].extend([0] * (epoch + 1 - len(all_losses[name])))
+                    all_losses[name][epoch] += value
         
         elapsed = time.time() - start
         
@@ -277,7 +311,7 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
 
 
 
-        log_msg = f"[{epoch}/{train_config['n_epochs']}] " + \
+        log_msg = f"[{epoch}/{total_epochs}] " + \
                  "\t".join(f"{k}:{v[epoch]:.2f}" for k, v in all_losses.items()) + \
                  f"  epoch: {elapsed:.2f}s"
         tqdm.write(log_msg)
@@ -286,11 +320,26 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
         # ---------------- 5-2) Model save ----------------  
 
         if epoch % n_eval == 0:
-            tqdm.write(f"[{epoch // n_eval}/{train_config['n_epochs'] // n_eval}]", end=" | ")
+            tqdm.write(f"[{epoch // n_eval}/{total_epochs // n_eval}]", end=" | ")
             start = time.time()
 
-            torch.save(model.state_dict(), 
-                      os.path.join(save_path, f"model_{model_name}.pth"))
+            # Save comprehensive checkpoint including optimizer state
+            checkpoint_data = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'epoch': epoch,
+                'loss': all_losses.get('total_loss', [0])[-1] if all_losses else 0,
+                'all_losses': all_losses,
+                'timestamp': datetime.now().isoformat()
+            }
+
+            torch.save(checkpoint_data, os.path.join(save_path, f"model_{model_name}.pth"))
+
+            # Also save loss history separately for easier access
+            loss_history_path = os.path.join(save_path, "loss_history.json")
+            with open(loss_history_path, 'w') as f:
+                json.dump(all_losses, f, indent=2)
             
             # 5-2-1) Loss curve
             plot_loss(all_losses, save_path, model_name)
@@ -396,14 +445,32 @@ def plot_loss(all_losses, save_path, model_name):
 
 def train_model(config: Dict[str, Any]) -> nn.Module:
 
-    
-    # ---------------- 1) get config ----------------  
-    # 1-1) get timestamp
-    timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
-    save_path = os.path.join("generative_ts/saves", timestamp)
-    os.makedirs(save_path, exist_ok=True)
-    os.makedirs(os.path.join(save_path, "anl"), exist_ok=True)
-    os.makedirs(os.path.join(save_path, "post"), exist_ok=True)
+
+    # ---------------- 1) get config ----------------
+    # Check if this is resume mode
+    is_resume = config.get('resume', False)
+
+    if is_resume:
+        # Resume mode: use existing save_path and info
+        resume_info = config['resume_info']
+        save_path = resume_info['save_path']
+        start_epoch = resume_info['epoch']
+        best_loss = resume_info['best_loss']
+        print(f"🔄 Resuming training from epoch {start_epoch}")
+        print(f"📁 Using existing save path: {save_path}")
+
+        # Ensure subdirectories exist
+        os.makedirs(os.path.join(save_path, "anl"), exist_ok=True)
+        os.makedirs(os.path.join(save_path, "post"), exist_ok=True)
+    else:
+        # New training mode: create new timestamped directory
+        timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+        save_path = os.path.join("generative_ts/saves", timestamp)
+        os.makedirs(save_path, exist_ok=True)
+        os.makedirs(os.path.join(save_path, "anl"), exist_ok=True)
+        os.makedirs(os.path.join(save_path, "post"), exist_ok=True)
+        start_epoch = 0
+        best_loss = float('inf')
     
     # 1-2) save config
     with open(os.path.join(save_path, "config.json"), 'w') as f:
@@ -415,25 +482,43 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
             import shutil
             shutil.copy2(yaml_config_path, os.path.join(save_path, "ls4_config.yaml"))
     
-    # ---------------- 2) make model ---------------- 
+    # ---------------- 2) make model ----------------
     model_type = config['model_type']
     model_config = config['model']
     train_config = config['train']
-    
+
+    if is_resume:
+        # Resume mode: model is already loaded from checkpoint
+        print(f"🔄 Model already loaded from checkpoint")
+        # The model is already in config['resume_info'] but we need to access it differently
+        # We'll create the model and then it will be loaded in the training loop setup
+        pass
+
     if model_type == 'VRNN':
         from .models.vrnn import VRNN_ts
 
-        model = VRNN_ts(
-            x_dim=1,
-            z_dim=model_config.get('z_dim', 1),
-            h_dim=model_config.get('h_dim', 10),
-            n_layers=model_config.get('n_layers', 1),
-            lmbd=model_config.get('lmbd', 0),
-            std_Y=train_config.get('std_Y', 0.01)
-        ).to(DEVICE)
-        
+        if not is_resume:
+            model = VRNN_ts(
+                x_dim=1,
+                z_dim=model_config.get('z_dim', 1),
+                h_dim=model_config.get('h_dim', 10),
+                n_layers=model_config.get('n_layers', 1),
+                lmbd=model_config.get('lmbd', 0),
+                std_Y=train_config.get('std_Y', 0.01)
+            ).to(DEVICE)
+        else:
+            # Model structure for resume mode
+            model = VRNN_ts(
+                x_dim=1,
+                z_dim=model_config.get('z_dim', 1),
+                h_dim=model_config.get('h_dim', 10),
+                n_layers=model_config.get('n_layers', 1),
+                lmbd=model_config.get('lmbd', 0),
+                std_Y=train_config.get('std_Y', 0.01)
+            ).to(DEVICE)
+
     elif model_type == 'LS4':
-        from .models.ls4 import LS4_ts, AttrDict, dict2attr
+        from .models.ls4 import LS4_ts, dict2attr
         # Load LS4 config
         cfg_path = model_config.get('config_path', 'generative_ts/config/ls4_config.yaml')
         cfg_all = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
@@ -443,7 +528,7 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
         # Modify config for our task
         ls4_config.n_labels = 1
         ls4_config.classifier = False
-        
+
         model = LS4_ts(ls4_config).to(DEVICE)
         # Setup RNN for inference/generation
         model.setup_rnn(mode='dense')
@@ -476,7 +561,12 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
         raise ValueError("dataset_path must be specified in config")
     
     # Train model using unified train function
-    model = train(model, train_config, save_path, model_type, dataset_path)
-    
+    # Pass resume information if available
+    if is_resume:
+        model = train(model, train_config, save_path, model_type, dataset_path,
+                     resume_info=resume_info, start_epoch=start_epoch)
+    else:
+        model = train(model, train_config, save_path, model_type, dataset_path)
+
     print(f"Training completed! Results saved to: {save_path}")
     return model

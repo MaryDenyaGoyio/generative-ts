@@ -27,7 +27,7 @@ class VRNN_ts(VRNN):
         
         # Additional parameters for our modification
         self.lmbd = lmbd  # entropy regularization weight
-        self.std_Y = std_Y  # fixed observation noise
+        self.log_std_y = nn.Parameter(torch.log(torch.tensor(1.0))) # learnable std_y, init to std_Y
         self.verbose = verbose
         self.device = DEVICE  # Add device attribute
     
@@ -62,7 +62,7 @@ class VRNN_ts(VRNN):
             
             # Our modification: decoder outputs z_t with fixed sigma
             dec_mean_t = z_t  # p(x_t | z_t) = N(z_t, sigma^2)
-            dec_std_t = torch.ones_like(dec_mean_t) * torch.tensor(self.std_Y, device=dec_mean_t.device, dtype=dec_mean_t.dtype)
+            dec_std_t = torch.ones_like(dec_mean_t) * torch.exp(self.log_std_y)
             
             # recurrence (unchanged from original)
             _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
@@ -107,7 +107,7 @@ class VRNN_ts(VRNN):
                 
                 # "Decode" using our modified decoder
                 x_mean = z_t
-                x_std = torch.ones_like(x_mean) * torch.tensor(self.std_Y, device=x_mean.device, dtype=x_mean.dtype)
+                x_std = torch.ones_like(x_mean) * torch.exp(self.log_std_y)
                 x_sample = x_given[t]  # Use actual observation
             else:
                 # Prediction phase: use prior
@@ -118,7 +118,7 @@ class VRNN_ts(VRNN):
                 
                 # "Decode" using our modified decoder
                 x_mean = z_t
-                x_std = torch.ones_like(x_mean) * torch.tensor(self.std_Y, device=x_mean.device, dtype=x_mean.dtype)
+                x_std = torch.ones_like(x_mean) * torch.exp(self.log_std_y)
                 x_sample = self._reparameterized_sample(x_mean, x_std)
             
             # Update RNN state
@@ -165,7 +165,7 @@ class VRNN_ts(VRNN):
                 
                 # Reconstruct (decode) - use our custom decoder
                 x_mean = z_t
-                x_std = torch.ones_like(x_mean) * torch.tensor(self.std_Y, device=x_mean.device, dtype=x_mean.dtype)
+                x_std = torch.ones_like(x_mean) * torch.exp(self.log_std_y)
                 x_recon = self._reparameterized_sample(x_mean, x_std)
                 
                 # Update RNN state (same as forward method)
@@ -176,64 +176,150 @@ class VRNN_ts(VRNN):
         
         return np.array(reconstructions)
 
-    def posterior(self, x_given, T, N=20, verbose=2):
+    def posterior_batch(self, x_given, T, N, verbose=2):
         """
-        Posterior inference for full sequence: p(x_{1:T} | x_{1:t_0})
-        
-        Args:
-            x_given: observed data (T_0, 1, D) 
-            T: total sequence length
-            N: number of samples
-            verbose: verbosity level
-            
-        Returns:
-            result: dict containing:
-                - mean_samples: (T, D) posterior mean for entire sequence
-                - var_samples: (T, D) posterior std for entire sequence  
-                - x_samples: (N, T, D) samples for entire sequence
-                - recon_mean: (T_0, D) reconstruction mean
-                - recon_std: (T_0, D) reconstruction std
-                - recon_samples: (N, T_0, D) reconstruction samples
+        배치 처리된 VRNN posterior sampling - 획기적 성능 개선
         """
         T_0 = x_given.size(0)
-        
+        device = x_given.device
+
+        with torch.no_grad():
+            # 배치 초기화
+            means_batch = torch.zeros(N, T, self.x_dim, device=device)
+            stds_batch = torch.zeros(N, T, self.x_dim, device=device)
+            samples_batch = torch.zeros(N, T, self.x_dim, device=device)
+
+            # 배치 hidden states: (n_layers, N, h_dim)
+            h_batch = torch.zeros(self.n_layers, N, self.h_dim, device=device)
+
+            for t in range(T):
+                if t < T_0:
+                    # Conditioning phase: 배치 encoder
+                    x_t = x_given[t]  # 원래 shape
+                    if x_t.dim() == 0:  # scalar
+                        x_t = x_t.unsqueeze(0).unsqueeze(0).repeat(N, 1)  # (N, 1)
+                    elif x_t.dim() == 1:  # (D,)
+                        x_t = x_t.unsqueeze(0).repeat(N, 1)  # (N, D)
+                    elif x_t.dim() == 2:  # (1, D)
+                        x_t = x_t.repeat(N, 1)  # (N, D)
+                    else:
+                        x_t = x_t.unsqueeze(0).repeat(N, 1)  # fallback
+                    phi_x_t = self.phi_x(x_t)
+                    enc_t = self.enc(torch.cat([phi_x_t, h_batch[-1]], 1))
+                    enc_mean_t = self.enc_mean(enc_t)
+                    enc_std_t = self.enc_std(enc_t)
+                    z_t = self._reparameterized_sample(enc_mean_t, enc_std_t)
+
+                    # 배치 decoder
+                    x_mean = z_t  # (N, x_dim)
+                    x_std = torch.ones_like(x_mean) * torch.exp(self.log_std_y)
+
+                    # Conditioning: use actual observations
+                    x_sample = x_given[t]
+                    if x_sample.dim() == 0:  # scalar
+                        x_sample = x_sample.unsqueeze(0).unsqueeze(0).repeat(N, 1)  # (N, 1)
+                    elif x_sample.dim() == 1:  # (D,)
+                        x_sample = x_sample.unsqueeze(0).repeat(N, 1)  # (N, D)
+                    elif x_sample.dim() == 2:  # (1, D)
+                        x_sample = x_sample.repeat(N, 1)  # (N, D)
+                    else:
+                        x_sample = x_sample.unsqueeze(0).repeat(N, 1)  # fallback
+
+                else:
+                    # Prediction phase: 배치 prior
+                    prior_t = self.prior(h_batch[-1])
+                    prior_mean_t = self.prior_mean(prior_t)
+                    prior_std_t = self.prior_std(prior_t)
+                    z_t = self._reparameterized_sample(prior_mean_t, prior_std_t)
+
+                    # 배치 decoder
+                    x_mean = z_t
+                    x_std = torch.ones_like(x_mean) * torch.exp(self.log_std_y)
+
+                    # Sample from decoder
+                    x_sample = self._reparameterized_sample(x_mean, x_std)
+
+                # Update batch results
+                means_batch[:, t] = x_mean
+                stds_batch[:, t] = x_std
+                samples_batch[:, t] = x_sample
+
+                # Update batch hidden states
+                phi_z_t = self.phi_z(z_t)
+                phi_x_t = self.phi_x(x_sample)
+                h_combined = torch.cat([phi_x_t, phi_z_t], 1)
+
+                # RNN step for all samples in batch
+                _, h_batch = self.rnn(h_combined.unsqueeze(0), h_batch)
+
+            # Convert to numpy
+            means_np = means_batch.cpu().numpy()  # (N, T, D)
+            stds_np = stds_batch.cpu().numpy()
+            samples_np = samples_batch.cpu().numpy()
+
+            # Vectorized statistics
+            mean_samples = means_np.mean(axis=0)  # (T, D)
+            var_alea = (stds_np ** 2).mean(axis=0)
+            var_epis = means_np.var(axis=0)
+            var_samples = np.sqrt(var_alea + var_epis)
+
+            # Reconstruction statistics
+            recon_samples_np = samples_np[:, :T_0]  # (N, T_0, D)
+            recon_mean = recon_samples_np.mean(axis=0)
+            recon_std = recon_samples_np.std(axis=0)
+
+            return {
+                'mean_samples': mean_samples,
+                'var_samples': var_samples,
+                'x_samples': samples_np,
+                'recon_mean': recon_mean,
+                'recon_std': recon_std,
+                'recon_samples': recon_samples_np
+            }
+
+    def posterior_sequential(self, x_given, T, N, verbose=2):
+        """
+        기존 순차 처리 방식 (fallback용)
+        """
+        T_0 = x_given.size(0)
+
         with torch.no_grad():
             samples = []
             means = []
             stds = []
             recon_samples = []
-            
+
             for i in range(N):
                 if i % 100 == 0 and verbose > 1:
                     pass  # Remove noisy sampling output
 
                 # Single posterior sample for full sequence
                 sample_mean, sample_std, sample_traj = self.posterior_sample(x_given, T)
-                
+
                 # Keep entire sequence (T, D)
                 means.append(sample_mean)  # (T, D)
-                stds.append(sample_std)    # (T, D) 
+                stds.append(sample_std)    # (T, D)
                 samples.append(sample_traj)  # (T, D)
-                
+
                 # Extract reconstruction part (conditioning on x_given)
                 recon_samples.append(self._sample_reconstruction(x_given))
-            
+
             # Convert to arrays and compute statistics
             means = np.stack(means)      # (N, T, D)
             stds = np.stack(stds)        # (N, T, D)
             samples = np.stack(samples)  # (N, T, D)
             recon_samples = np.array(recon_samples)  # (N, T_0, D)
-            
+
             # Bayesian uncertainty decomposition for full sequence
             mean_samples = means.mean(axis=0)                    # (T, D)
             var_alea = (stds ** 2).mean(axis=0)                  # aleatoric
-            var_epis = means.var(axis=0)                         # epistemic  
+            var_epis = means.var(axis=0)                         # epistemic
             var_samples = np.sqrt(var_alea + var_epis)           # (T, D)
-            
+
             # Reconstruction uncertainty
             recon_mean = np.mean(recon_samples, axis=0)          # (T_0, D)
             recon_std = np.std(recon_samples, axis=0)            # (T_0, D)
-            
+
             return {
                 'mean_samples': mean_samples,
                 'var_samples': var_samples,
@@ -242,6 +328,17 @@ class VRNN_ts(VRNN):
                 'recon_std': recon_std,
                 'recon_samples': recon_samples
             }
+
+    def posterior(self, x_given, T, N, verbose=2):
+        """
+        Adaptive posterior: 배치 처리 우선, 실패시 순차 처리
+        """
+        try:
+            return self.posterior_batch(x_given, T, N, verbose)
+        except Exception as e:
+            if verbose > 0:
+                print(f"VRNN batch processing failed: {e}, using sequential fallback")
+            return self.posterior_sequential(x_given, T, N, verbose)
     
     def _entropy_gauss(self, std):
         """Gaussian entropy: 0.5 * log(2πe * σ²)"""

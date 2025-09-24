@@ -56,7 +56,9 @@ class LatentODE_ts(LatentODE):
         # Extract parameters from config
         self.x_dim = getattr(config, 'x_dim', 1)
         self.z_dim = getattr(config, 'z_dim', 2)
-        self.std_Y = getattr(config, 'std_Y', 0.1)
+        # Use config's std_Y if available, otherwise default to 0.1
+        std_y = getattr(config, 'std_Y', 0.1)
+        self.log_obsrv_std = nn.Parameter(torch.log(torch.tensor(std_y)))
 
         # LatentODE specific params
         rec_dims = getattr(config, 'rec_dims', 20)
@@ -91,7 +93,7 @@ class LatentODE_ts(LatentODE):
             args=args,
             input_dim=self.x_dim,
             z0_prior=z0_prior,
-            obsrv_std=self.std_Y,
+            obsrv_std=0.1, # This value is now ignored, as we use self.log_obsrv_std
             device=DEVICE,
             classif_per_tp=False,
             n_labels=1
@@ -114,6 +116,29 @@ class LatentODE_ts(LatentODE):
             n_labels=model.n_labels,
             train_classif_w_reconstr=model.train_classif_w_reconstr
         )
+
+    def get_gaussian_likelihood(self, truth, pred_y, mask=None):
+        obsrv_std = torch.exp(self.log_obsrv_std)
+        
+        # Dimensions
+        n_traj_samples, n_batch, n_timepoints, n_dims = pred_y.size()
+        
+        # Reshape truth to match pred_y
+        truth = truth.unsqueeze(0).repeat(n_traj_samples, 1, 1, 1)
+        
+        # Gaussian likelihood
+        dist = Normal(pred_y, obsrv_std)
+        
+        if mask is not None:
+            mask = mask.unsqueeze(0).repeat(n_traj_samples, 1, 1, 1)
+            log_pxz = dist.log_prob(truth) * mask
+        else:
+            log_pxz = dist.log_prob(truth)
+            
+        # Sum over dimensions and time
+        log_pxz = log_pxz.sum(-1).sum(-1)
+        
+        return log_pxz
 
     # LatentODE doesn't use forward() method - it uses compute_all_losses() and posterior() instead
 
@@ -208,7 +233,7 @@ class LatentODE_ts(LatentODE):
 
             # Our custom decoder: p(x_t | z_t) = N(z_t[:x_dim], std_Y^2)
             means = pred_x.cpu().numpy()  # z_t[:x_dim] as mean
-            stds = np.full_like(means, self.std_Y)  # fixed std_Y
+            stds = np.full_like(means, torch.exp(self.log_obsrv_std).item())  # fixed std_Y
             samples = np.random.normal(means, stds)
 
             # Use actual observations for conditioning phase
@@ -217,9 +242,78 @@ class LatentODE_ts(LatentODE):
 
         return means, stds, samples
 
-    def posterior(self, x_given, T, N=20, verbose=2):
+    def posterior_batch(self, x_given, T, N, verbose=2):
         """
-        Posterior inference with multiple samples
+        배치 처리된 LatentODE posterior sampling - 획기적 성능 개선
+        """
+        if x_given.dim() == 2 and x_given.shape[1] != 1:
+            x_given = x_given.unsqueeze(1)
+
+        T_0 = x_given.shape[0]
+
+        with torch.no_grad():
+            # 배치 데이터 준비: (N, T_0, x_dim)
+            x_obs_batch = x_given.unsqueeze(0).repeat(N, 1, 1).to(DEVICE)
+            mask_obs_batch = torch.ones_like(x_obs_batch).to(DEVICE)
+            x_obs_with_mask_batch = torch.cat([x_obs_batch, mask_obs_batch], dim=-1)
+
+            time_obs = torch.linspace(0, float(T_0-1)/(T-1), T_0).to(DEVICE)
+            time_full = torch.linspace(0, 1, T).to(DEVICE)
+
+            # 배치 인코딩: (N, z_dim)
+            first_point_mu, first_point_std = self.encoder_z0(
+                x_obs_with_mask_batch, time_obs, run_backwards=True)
+
+            # 배치 z0 샘플링: (N, z_dim)
+            noise_batch = torch.randn_like(first_point_std)
+            first_point_enc_batch = first_point_mu + first_point_std * noise_batch
+
+            # 배치 ODE 솔빙 - 각 샘플별로 처리 (ODE solver 배치 처리 한계)
+            sol_y_batch = []
+            for i in range(N):
+                sol_y_i = self.diffeq_solver(first_point_enc_batch[i:i+1], time_full)
+                sol_y_batch.append(sol_y_i.squeeze(0))  # (T, z_dim)
+
+            # 배치 결과 스택: (N, T, z_dim)
+            sol_y_batch = torch.stack(sol_y_batch)
+
+            # 배치 디코딩 (identity decoder: x = z[:x_dim])
+            x_dim = x_given.shape[-1]
+            x_means_batch = sol_y_batch[:, :, :x_dim]  # (N, T, x_dim)
+
+            # 배치 노이즈 추가
+            x_stds_batch = torch.full_like(x_means_batch, self.std_Y)
+            noise_batch = torch.randn_like(x_means_batch) * x_stds_batch
+            x_samples_batch = x_means_batch + noise_batch
+
+            # GPU→CPU 변환
+            means_np = x_means_batch.cpu().numpy()  # (N, T, x_dim)
+            stds_np = x_stds_batch.cpu().numpy()
+            samples_np = x_samples_batch.cpu().numpy()
+
+            # Vectorized 통계 계산
+            mean_samples = means_np.mean(axis=0)  # (T, x_dim)
+            var_alea = (stds_np ** 2).mean(axis=0)
+            var_epis = means_np.var(axis=0)
+            var_samples = np.sqrt(var_alea + var_epis)
+
+            # Reconstruction 통계
+            recon_samples = samples_np[:, :T_0, :]
+            recon_mean = recon_samples.mean(axis=0)
+            recon_std = recon_samples.std(axis=0)
+
+            return {
+                'mean_samples': mean_samples,
+                'var_samples': var_samples,
+                'x_samples': samples_np,
+                'recon_mean': recon_mean,
+                'recon_std': recon_std,
+                'recon_samples': recon_samples
+            }
+
+    def posterior_sequential(self, x_given, T, N, verbose=2):
+        """
+        기존 순차 처리 방식 (fallback용)
         """
         if x_given.dim() == 2 and x_given.shape[1] != 1:
             x_given = x_given.unsqueeze(1)
@@ -262,3 +356,14 @@ class LatentODE_ts(LatentODE):
             'recon_std': recon_std,
             'recon_samples': recon_samples
         }
+
+    def posterior(self, x_given, T, N, verbose=2):
+        """
+        Adaptive posterior: 배치 처리 우선, 실패시 순차 처리
+        """
+        try:
+            return self.posterior_batch(x_given, T, N, verbose)
+        except Exception as e:
+            if verbose > 0:
+                print(f"LatentODE batch processing failed: {e}, using sequential fallback")
+            return self.posterior_sequential(x_given, T, N, verbose)

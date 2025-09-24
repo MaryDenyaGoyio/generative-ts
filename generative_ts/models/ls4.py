@@ -38,7 +38,7 @@ def dict2attr(d):
 
 class Decoder_ts(Decoder_ls4):
     """
-    p( x_t | z_<=t ) = N( x_t, std_Y^2 )
+    p( x_t | z_<=t ) = N( z_t, std_Y^2 )
     """
     
     def __init__(self, config, sigma, z_dim, in_channels, bidirectional):
@@ -47,7 +47,7 @@ class Decoder_ts(Decoder_ls4):
         # Override sigmoid activation to identity
         self.act = nn.Identity()
 
-        # Make sigma a learnable parameter
+        # Make sigma a learnable parameter, initialized to provided sigma
         self.log_sigma = nn.Parameter(torch.log(torch.tensor(sigma)))
 
         if z_dim != in_channels:
@@ -193,46 +193,129 @@ class LS4_ts(VAE_ls4):
                     return x_mean, x_std, x_sample
                     
 
-    def posterior(self, x_given, T, N=20, verbose=2):
+    def posterior_batch(self, x_given, T, N, verbose=2):
         """
-        p( x_<=T | x_<=T_0 ) : N sample, mean, var
+        배치 처리된 posterior sampling - 획기적 성능 개선
+        p( x_<=T | x_<=T_0 ) : N sample, mean, var (vectorized)
         """
         T_0 = x_given.size(0)
-        
+        device = x_given.device
+
+        with torch.no_grad():
+            self.setup_rnn(mode='dense')
+
+            # 배치 입력 준비: 차원 안전하게 처리
+            if x_given.dim() == 1:  # (T_0,)
+                x_obs_batch = x_given.unsqueeze(0).unsqueeze(-1)  # (1, T_0, 1)
+            elif x_given.dim() == 2:  # (T_0, 1)
+                x_obs_batch = x_given.unsqueeze(0)  # (1, T_0, 1)
+            elif x_given.dim() == 3:  # (T_0, 1, 1)
+                x_obs_batch = x_given.squeeze(1).unsqueeze(0)  # (1, T_0, 1)
+            else:
+                x_obs_batch = x_given.unsqueeze(0)
+
+            # N개로 복제: (N, T_0, 1)
+            x_obs_batch = x_obs_batch.repeat(N, 1, 1)
+            t_vec_obs = torch.arange(T_0, dtype=torch.float32, device=device)
+            t_vec_pred = torch.arange(T_0, T, dtype=torch.float32, device=device)
+
+            if len(t_vec_pred) == 0:
+                # Reconstruction only
+                x_recon_batch = super().reconstruct(x_obs_batch, t_vec_obs)  # (N, T_0, 1)
+                x_mean_batch = x_recon_batch.cpu().numpy()
+
+                # 배치 noise 생성
+                sigma = torch.exp(self.decoder.log_sigma)
+                x_std_batch = (sigma * torch.ones_like(x_recon_batch)).cpu().numpy()
+                eps_batch = np.random.randn(*x_mean_batch.shape) * x_std_batch
+                x_samples_batch = x_mean_batch + eps_batch
+
+            else:
+                # Reconstruction + Prediction - 배치 처리
+                try:
+                    x_full_batch = super().reconstruct(x_obs_batch, t_vec_obs, t_vec_pred=t_vec_pred)  # (N, T, 1)
+
+                    if x_full_batch.shape[1] != T:
+                        x_recon_batch = super().reconstruct(x_obs_batch, t_vec_obs)
+                        x_full_batch = torch.cat([x_recon_batch, x_full_batch], dim=1)
+
+                    x_mean_batch = x_full_batch.cpu().numpy()  # (N, T, 1)
+
+                    # 배치 uncertainty
+                    sigma = torch.exp(self.decoder.log_sigma)
+                    x_std_batch = (sigma * torch.ones_like(x_full_batch)).cpu().numpy()
+                    eps_batch = np.random.randn(*x_mean_batch.shape) * x_std_batch
+                    x_samples_batch = x_mean_batch + eps_batch
+
+                except Exception as e:
+                    if verbose > 0:
+                        print(f"Batch reconstruct failed: {e}, using fallback")
+                    return self.posterior_sequential(x_given, T, N, verbose)
+
+            # 통계 계산 (vectorized)
+            mean_samples = x_mean_batch.mean(axis=0)  # (T, D)
+            var_alea = (x_std_batch ** 2).mean(axis=0)  # aleatoric
+            var_epis = x_mean_batch.var(axis=0)  # epistemic
+            var_samples = np.sqrt(var_alea + var_epis)  # (T, D)
+
+            return {
+                'mean_samples': mean_samples,
+                'var_samples': var_samples,
+                'x_samples': x_samples_batch,
+                'recon_samples': []
+            }
+
+    def posterior_sequential(self, x_given, T, N, verbose=2):
+        """
+        기존 순차 처리 방식 (fallback용)
+        """
+        T_0 = x_given.size(0)
+
         with torch.no_grad():
             samples = []
             means = []
             stds = []
             recon_samples = []
-            
+
             for i in range(N):
                 if i % 100 == 0 and verbose > 1:
                     pass  # Remove noisy sampling output
 
                 # Single posterior sample for full sequence
                 sample_mean, sample_std, sample_traj = self.posterior_sample(x_given, T)
-                
+
                 # Keep entire sequence (T, D)
                 means.append(sample_mean)  # (T, D)
-                stds.append(sample_std)    # (T, D) 
+                stds.append(sample_std)    # (T, D)
                 samples.append(sample_traj)  # (T, D)
-                
+
 
             # Convert to arrays and compute statistics
             means = np.stack(means)      # (N, T, D)
             stds = np.stack(stds)        # (N, T, D)
             samples = np.stack(samples)  # (N, T, D)
-            
+
             # Bayesian uncertainty decomposition for full sequence
             mean_samples = means.mean(axis=0)                    # (T, D)
             var_alea = (stds ** 2).mean(axis=0)                  # aleatoric
-            var_epis = means.var(axis=0)                         # epistemic  
+            var_epis = means.var(axis=0)                         # epistemic
             var_samples = np.sqrt(var_alea + var_epis)           # (T, D)
-            
+
             return {
                 'mean_samples': mean_samples,
                 'var_samples': var_samples,
                 'x_samples': samples,
                 'recon_samples': recon_samples
             }
+
+    def posterior(self, x_given, T, N, verbose=2):
+        """
+        Adaptive posterior: 배치 처리 우선, 실패시 순차 처리
+        """
+        try:
+            return self.posterior_batch(x_given, T, N, verbose)
+        except Exception as e:
+            if verbose > 0:
+                print(f"Batch processing failed: {e}, using sequential fallback")
+            return self.posterior_sequential(x_given, T, N, verbose)
     

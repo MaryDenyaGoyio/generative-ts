@@ -186,7 +186,9 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     plt.close()
     
     pass  # Posterior plot saved silently
-    
+
+
+
 
 def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fixed_sample_idx=None):
     """
@@ -212,20 +214,15 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
             data = torch.load(dataset_path, weights_only=False)
         Y_test = data['Y_test']
     else:
-        # Generate simple test data for plotting
-        T = 20  # Match training data length
-        t = np.linspace(0, 4, T)
-        y = np.sin(t) + 0.1 * np.random.randn(T)
-        Y_test = [y]  # Single test sample
-        data = {'Y_test': Y_test}
+        pass
     
     # Get sigma_Y from dataset config
     if 'config' in data and 'data' in data['config']:
         sigma_Y = data['config']['data'].get('std_Y', 0.01)
     elif hasattr(model, 'sigma_Y'):
         sigma_Y = model.sigma_Y
-    elif hasattr(model, 'std_Y'):
-        sigma_Y = model.std_Y
+    elif hasattr(model, 'log_std_y'):
+        sigma_Y = torch.exp(model.log_std_y).item()
     else:
         sigma_Y = 0.01  # fallback
     
@@ -270,7 +267,10 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                     prior_mean, prior_var = model.prior(theta_past, t)
                     prior_means[t] = prior_mean
                     prior_stds[t] = np.sqrt(prior_var)
-            
+
+            # Decoder sigma (observation noise)
+            decoder_stds = np.full(T, sigma_Y)
+
             kl_losses = kl_trajectory
             nll_losses = nll_trajectory
             
@@ -294,9 +294,16 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                 inference_stds = z_post_std.squeeze().cpu().numpy()
                 
                 
-                # Prior shows p(z_t | z_{<t}) in latent space  
+                # Prior shows p(z_t | z_{<t}) in latent space
                 prior_means = z_prior_mean.squeeze().cpu().numpy()
                 prior_stds = z_prior_std.squeeze().cpu().numpy()
+
+                # Decoder sigma (for sigma comparison plot)
+                if hasattr(model, 'decoder') and hasattr(model.decoder, 'log_sigma'):
+                    decoder_sigma = torch.exp(model.decoder.log_sigma).item()
+                    decoder_stds = np.full(T, decoder_sigma)
+                else:
+                    decoder_stds = dec_std.squeeze().cpu().numpy()
                 
                 # Compute step-by-step losses manually
                 kl_losses = []
@@ -332,6 +339,7 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                 inference_stds = np.full(T, sigma_Y)
                 prior_means = np.zeros(T)
                 prior_stds = np.ones(T)
+                decoder_stds = np.full(T, sigma_Y)
                 kl_losses = np.zeros(T)
                 nll_losses = np.full(T, 10)
                 
@@ -394,9 +402,13 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                     x_t_true = Y_tensor[t]  # Current observation
 
                     # Gaussian NLL: -log N(x_true | x_pred, std_Y^2)
-                    nll_t = 0.5 * ((x_t_true - x_t_pred) / model.std_Y) ** 2
-                    nll_t += 0.5 * np.log(2 * np.pi * model.std_Y ** 2)
+                    obsrv_std = torch.exp(model.log_obsrv_std).item()
+                    nll_t = 0.5 * ((x_t_true - x_t_pred) / obsrv_std) ** 2
+                    nll_t += 0.5 * np.log(2 * np.pi * obsrv_std ** 2)
                     nll_losses[t] = nll_t.item()
+
+                # Decoder sigma (learnable for LatentODE)
+                decoder_stds = np.full(T, torch.exp(model.log_obsrv_std).item())
 
                 pass  # LatentODE step-by-step analysis completed silently
 
@@ -409,6 +421,7 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                 inference_stds = np.full(T, sigma_Y)
                 prior_means = np.zeros(T)
                 prior_stds = np.ones(T)
+                decoder_stds = np.full(T, sigma_Y)
                 kl_losses = np.zeros(T)
                 nll_losses = np.full(T, 10)
 
@@ -459,15 +472,18 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                     
                     prior_means[t] = prior_mean.item()
                     prior_stds[t] = prior_std.item()
-                    
+
                     # Use VRNN's internal loss functions (not manual calculation)
                     kl_losses[t] = model._kld_gauss(enc_mean, enc_std, prior_mean, prior_std).item()
                     nll_losses[t] = model._nll_gauss(enc_mean, enc_std, x_t).item()  # VRNN decoder: x = z
-                    
+
                     # Update state
                     z_t = enc_mean + enc_std * torch.randn_like(enc_mean)
                     phi_z_t = model.phi_z(z_t)
                     _, h = model.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
+
+                # Decoder sigma (learnable observation noise for VRNN)
+                decoder_stds = np.full(T, torch.exp(model.log_std_y).item())
                 
             except Exception as e:
                 print(f"VRNN forward pass failed: {e}")
@@ -478,12 +494,13 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
                 inference_stds = np.full(T, sigma_Y)
                 prior_means = np.zeros(T)
                 prior_stds = np.ones(T)
+                decoder_stds = np.full(T, sigma_Y)
                 kl_losses = np.zeros(T)
                 nll_losses = np.full(T, 10)
     
     # Create diagnostic plot
-    plt.figure(figsize=(16, 14))
-    gs = gridspec.GridSpec(4, 1, height_ratios=[3, 1, 0.6, 0.6], hspace=0.4)
+    plt.figure(figsize=(16, 18))
+    gs = gridspec.GridSpec(5, 1, height_ratios=[3, 1, 0.6, 0.6, 0.8], hspace=0.4)
     
     # Top plot: trajectories
     ax1 = plt.subplot(gs[0])
@@ -532,11 +549,22 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, fix
     # Individual NLL plot
     ax4 = plt.subplot(gs[3])
     ax4.plot(time_steps, nll_losses, color='orange', linewidth=1, alpha=0.8)
-    ax4.set_xlabel('Time step t', fontsize=12)
     ax4.set_ylabel('NLL', fontsize=9)
     ax4.grid(True, alpha=0.3)
     ax4.tick_params(axis='both', which='major', labelsize=8)
-    
+
+    # Sigma comparison plot (new)
+    ax5 = plt.subplot(gs[4])
+    ax5.plot(time_steps, prior_stds, 'r-', linewidth=1.5, label='σ_prior (Prior)', alpha=0.8)
+    ax5.plot(time_steps, inference_stds, 'g-', linewidth=1.5, label='σ_encoder (Inference)', alpha=0.8)
+    ax5.plot(time_steps, decoder_stds, 'b-', linewidth=1.5, label='σ_decoder (Generation)', alpha=0.8)
+    ax5.set_xlabel('Time step t', fontsize=12)
+    ax5.set_ylabel('σ', fontsize=10)
+    ax5.legend(fontsize=9, loc='upper right')
+    ax5.grid(True, alpha=0.3)
+    ax5.tick_params(axis='both', which='major', labelsize=8)
+    ax5.set_title('Component-wise Standard Deviations', fontsize=11)
+
     try:
         plt.tight_layout()
     except Exception:

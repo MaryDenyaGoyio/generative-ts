@@ -1,0 +1,37 @@
+[Inference (q)]
+
+enc_input (T,B, 2·x_dim)
+  └─Encoder_z0_ODE_RNN──────────────────────────────────────────────────────────▶ h_enc (T,B, 2·rec_dims)
+       ├─f_enc   : create_net(rec_dims → units → rec_dims,
+       │                      n_layers = rec_layers)                             // ODEFunc; Euler solver
+       │            (Linear + Tanh blocks repeated rec_layers times)
+       │            • DiffeqSolver(method='euler')
+       │
+       ├─GRU_unit: (latent_dim = rec_dims, input_dim = 2·x_dim)
+       │      update/reset gate : Lin(2·rec_dims + 2·x_dim → gru_units)
+       │                          → Tanh → Lin(gru_units → rec_dims) → Sigmoid
+       │      candidate state   : Lin(2·rec_dims + 2·x_dim → gru_units)
+       │                          → Tanh → Lin(gru_units → 2·rec_dims)
+       │
+       └─transform_z0: Lin(2·rec_dims → units) → Tanh → Lin(units → 2·z_dim)
+             μ_z0 = out[..., :z_dim]                     // (T,B,z_dim)  마지막 시점 사용
+             σ_z0 = softplus(out[..., z_dim:]) + eps     // (T,B,z_dim)
+
+
+[Prior & Dynamics (pr)]
+
+p(z0) = N(0, I)  
+
+ODEFunc_latent : create_net(z_dim → units → z_dim,
+                            n_layers = gen_layers)
+                 (Linear + Tanh blocks repeated gen_layers times)
+
+Solver (forward): z_traj = odeint(ODEFunc_latent, z0, t_grid, method='dopri5')
+                   // shape (T, B, z_dim)
+
+
+[Generation (p)]
+
+z_traj (T,B,z_dim)
+  └─Decoder: Lin(z_dim → x_dim) ─────────────────────▶ μ_x (T,B,x_dim)
+σ_x = obsrv_std · 1                                   // broadcast to (T,B,x_dim)

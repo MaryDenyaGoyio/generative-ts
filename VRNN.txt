@@ -11,7 +11,6 @@ u (T,B,2·h_dim)
       ├─head_mu_q:     Lin(h_dim→z_dim) ────────────▶ μ_q (T,B,z_dim)
       └─head_preσ_q:   Lin(h_dim→z_dim)─softplus─+eps ─▶ σ_q (T,B,z_dim)
 
-reparam: z = μ_q + σ_q ⊙ ε   (ε ~ N(0,1), same shape)  // (T,B,z_dim)
 
 [Prior (pr)]
 
@@ -19,6 +18,7 @@ h_{t-1} (T,B,h_dim)
   └─prior_body: Lin(h_dim→h_dim)→ReLU ──────────────▶ p (T,B,h_dim)
       ├─head_mu_p:     Lin(h_dim→z_dim) ───────────▶ μ_p (T,B,z_dim)
       └─head_preσ_p:   Lin(h_dim→z_dim)─softplus─+eps ─▶ σ_p (T,B,z_dim)
+
 
 [Generation (p)]
 
@@ -34,6 +34,7 @@ d_in (T,B,2·h_dim)
 
 
 
+
 [Recurrent]
 
 Input: φ_x(x_t) (B,h_dim),   φ_z(z_t) (B,h_dim)  → concat → (B,2·h_dim)
@@ -41,6 +42,7 @@ Input: φ_x(x_t) (B,h_dim),   φ_z(z_t) (B,h_dim)  → concat → (B,2·h_dim)
 GRU: GRU(input_size=2·h_dim, hidden_size=h_dim, num_layers=n_layers, bias=False)
 
 Update: h_{t} = GRU([φ_x(x_t) ⊕ φ_z(z_t)], h_{t-1})        // (B,h_dim)
+
 
 
 
