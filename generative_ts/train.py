@@ -80,7 +80,7 @@ def load_pretrained_model(model_path, config_path, model_type='LS4'):
         raise ValueError(f"Unknown model_type: {model_type}")
 
 
-def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T_0_ratio = 1/4, resume_info=None, start_epoch=0):
+def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T_0_ratio = 1/4, start_epoch=0, all_losses=None):
 
     # ---------------- 0) beta VAE ----------------   
     beta = train_config.get('beta', 1.0)
@@ -137,18 +137,7 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
 
     # Load optimizer and scheduler state if resuming
     scheduler = None
-    if resume_info is not None:
-        if resume_info.get('optimizer_state') is not None:
-            optimizer.load_state_dict(resume_info['optimizer_state'])
-            print(f"🔄 Optimizer state restored")
-        if resume_info.get('scheduler_state') is not None:
-            # Create scheduler if it was used before
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.9)
-            scheduler.load_state_dict(resume_info['scheduler_state'])
-            print(f"🔄 Scheduler state restored")
-
-        # Model state is already loaded in resume_training_setup
-        print(f"🔄 Model weights already loaded from checkpoint")
+    # Optimizer and scheduler setup (no resume state for simplicity)
 
     test_data = Y_N[0:1].numpy()  # (1, T, D)
     x_test = torch.from_numpy(test_data.squeeze(0)).float().to(DEVICE)  # (T, D)
@@ -170,27 +159,28 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
     print(f"=======================     Training     =======================")
     print(f"================================================================\n")
     
-    all_losses = {}
+    # Load existing loss history if resuming, otherwise start empty
+    if all_losses is None:
+        all_losses = {}
 
-    # Load existing loss history if resuming
-    if resume_info is not None:
-        loss_history_path = os.path.join(save_path, "loss_history.json")
-        if os.path.exists(loss_history_path):
-            with open(loss_history_path, 'r') as f:
-                all_losses = json.load(f)
-            print(f"🔄 Loaded loss history with {len(list(all_losses.values())[0]) if all_losses else 0} epochs")
+    # Training loop: continue from start_epoch if resuming, 0 if new training
+    actual_start = start_epoch if start_epoch > 0 else start_epoch
 
-    # Training loop: continue from start_epoch + 1 if resuming, 0 if new training
-    actual_start = start_epoch + 1 if resume_info else start_epoch
-    total_epochs = actual_start + train_config['n_epochs']
+    # Resume: train from start_epoch+1 to n_epochs (not adding to existing)
+    # New: train from 0 to n_epochs-1
+    if start_epoch > 0:
+        # Resume mode: train from start_epoch+1 to n_epochs
+        total_epochs = train_config['n_epochs']
+        actual_start = start_epoch + 1
+        remaining_epochs = total_epochs - actual_start
+        print(f"Resuming training from epoch {actual_start} to {total_epochs-1} ({remaining_epochs} remaining epochs)")
+    else:
+        # New training: train from 0 to n_epochs-1
+        total_epochs = train_config['n_epochs']
+        actual_start = 0
+        print(f"Starting new training from epoch 0 to {total_epochs-1} (total {total_epochs} epochs)")
     for epoch in trange(actual_start, total_epochs, desc=f"[{model_name}]", unit="epoch", initial=actual_start, total=total_epochs):
         start = time.time()
-        
-        # Initialize loss entries for this epoch if needed
-        current_epoch_idx = epoch - start_epoch
-        for k, v in all_losses.items():
-            while len(v) <= current_epoch_idx + start_epoch:
-                v.append(0)
         
         num_batches = len(loader)
         
@@ -213,6 +203,16 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
                     train_loss = loss_dict['total_loss']
                 else:
                     train_loss = sum(v for v in loss_dict.values() if isinstance(v, torch.Tensor))
+
+                rollout_cfg = train_config.get('rollout') or {}
+                if rollout_cfg:
+                    segs = rollout_cfg.get('segments', 4)
+                    alpha = rollout_cfg.get('alpha', 1.0)
+                    rollout_loss = model.rollout_nll(data, segments=segs)
+                    rollout_term = alpha * rollout_loss
+                    loss_dict['rollout_loss'] = rollout_loss.detach()
+                    loss_dict['rollout_loss_weighted'] = rollout_term.detach()
+                    train_loss = train_loss + rollout_term
             
             # ---------------- 4-2) LS4 ----------------
             # LS4 expects (B, T, D) - data is already in this format
@@ -225,6 +225,16 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
 
 
                 loss_dict = apply_beta_to_kl_loss(loss_dict, beta)
+
+                rollout_cfg = train_config.get('rollout') or {}
+                if rollout_cfg:
+                    segs = rollout_cfg.get('segments', 4)
+                    alpha = rollout_cfg.get('alpha', 1.0)
+                    rollout_loss = model.rollout_nll(data, timepoints, segments=segs)
+                    rollout_term = alpha * rollout_loss
+                    loss_dict['rollout_loss'] = rollout_loss.detach()
+                    loss_dict['rollout_loss_weighted'] = rollout_term.detach()
+                    train_loss = train_loss + rollout_term
 
             # ---------------- 4-3) LatentODE ----------------
             # LatentODE expects batch_dict format - use existing compute_all_losses
@@ -282,10 +292,9 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
             optimizer.step()
             
 
-        # ---------------- 5-1) Loss logging ----------------
+            # ---------------- 5-1) Loss logging ----------------
             for name, each_loss in loss_dict.items():
-
-                if name.endswith("loss"):
+                if 'loss' in name:
                     if isinstance(each_loss, torch.Tensor):
                         value = (
                             each_loss.detach().cpu().item()
@@ -295,31 +304,49 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
                     else:
                         value = each_loss  # float
 
-
-                    # Initialize loss list to proper size if needed
+                    # Initialize loss list if needed (simple approach)
                     if name not in all_losses:
-                        all_losses[name] = [0] * (epoch + 1)
-                    elif len(all_losses[name]) <= epoch:
-                        all_losses[name].extend([0] * (epoch + 1 - len(all_losses[name])))
+                        all_losses[name] = []
+
+                    # Extend list to current epoch if needed
+                    while len(all_losses[name]) <= epoch:
+                        all_losses[name].append(0)
+
+                    # Accumulate current epoch loss
                     all_losses[name][epoch] += value
         
         elapsed = time.time() - start
         
         # Average the accumulated losses over number of batches
         for loss_name in all_losses:
-            all_losses[loss_name][epoch] /= num_batches
+            if len(all_losses[loss_name]) > epoch:
+                all_losses[loss_name][epoch] /= num_batches
 
 
 
-        log_msg = f"[{epoch}/{total_epochs}] " + \
-                 "\t".join(f"{k}:{v[epoch]:.2f}" for k, v in all_losses.items()) + \
-                 f"  epoch: {elapsed:.2f}s"
+        # Select which losses to display in log (exclude unwanted ones)
+        display_losses = []
+        loss_display_order = ['kld_loss', 'kl_loss', 'nll_loss', 'ent_loss', 'rollout_loss_weighted']
+        loss_display_names = {
+            'kld_loss': 'kld_loss',
+            'kl_loss': 'kl_loss',
+            'nll_loss': 'nll_loss',
+            'ent_loss': 'ent_loss',
+            'rollout_loss_weighted': 'rollout_loss'  # Remove "weighted" from display
+        }
+
+        for loss_name in loss_display_order:
+            if loss_name in all_losses and len(all_losses[loss_name]) > epoch:
+                display_name = loss_display_names[loss_name]
+                display_losses.append(f"{display_name}:{all_losses[loss_name][epoch]:.2f}")
+
+        log_msg = f"[{epoch}/{total_epochs}] " + "\t".join(display_losses) + f"  epoch: {elapsed:.2f}s"
         tqdm.write(log_msg)
         
         
         # ---------------- 5-2) Model save ----------------  
 
-        if epoch % n_eval == 0:
+        if epoch % n_eval == 0 or epoch == total_epochs - 1:
             tqdm.write(f"[{epoch // n_eval}/{total_epochs // n_eval}]", end=" | ")
             start = time.time()
 
@@ -357,90 +384,113 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
             
             elapsed = time.time() - start
             tqdm.write(f"eval: {elapsed:.2f}s")
-    
+
+    # Final checkpoint already saved in evaluation blocks
+
     return model
 
 
 def plot_loss(all_losses, save_path, model_name):
     """
-    Plot loss curves (KLD and NLL components)
+    Plot loss curves in a clean 2x4 layout: Total, KL, NLL, Ent, then same for recent 100 epochs
 
     Args:
         all_losses: dictionary containing loss history
         save_path: directory to save the plot
         model_name: name of the model for filename
     """
-    # Support both naming conventions for compatibility
-    desired_losses = ['kl_loss', 'kld_loss', 'nll_loss']  # KL, NLL (components of total)
-    loss_keys = [key for key in desired_losses if key in all_losses and len(all_losses[key]) > 0]
+    # Find available losses
+    loss_keys = [k for k, v in all_losses.items() if v and len(v) > 0 and 'loss' in k]
+    if not loss_keys:
+        return
 
-    if len(loss_keys) > 0:
-        # 2x3 layout: Total Loss + Individual component losses
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    # Define loss order and colors
+    loss_order = ['kl_loss', 'kld_loss', 'nll_loss', 'ent_loss', 'rollout_loss_weighted']
+    colors = {'kl_loss': 'red', 'kld_loss': 'red', 'nll_loss': 'green',
+              'ent_loss': 'blue', 'rollout_loss_weighted': 'purple'}
+    titles = {'kl_loss': 'KL', 'kld_loss': 'KL', 'nll_loss': 'NLL',
+              'ent_loss': 'Ent', 'rollout_loss_weighted': 'Rollout'}
 
-        # Define colors for consistency
-        colors = {'kl_loss': 'red', 'kld_loss': 'red', 'nll_loss': 'green'}
-        labels = {'kl_loss': 'KL', 'kld_loss': 'KL', 'nll_loss': 'NLL'}
+    # Get available losses in order
+    available_losses = []
+    for loss_name in loss_order:
+        if loss_name in loss_keys:
+            available_losses.append(loss_name)
+            break  # Only take first KL if both kl_loss and kld_loss exist
 
-        recent_start = max(0, len(all_losses[loss_keys[0]]) - 100)
+    for loss_name in ['nll_loss', 'ent_loss', 'rollout_loss_weighted']:
+        if loss_name in loss_keys:
+            available_losses.append(loss_name)
 
-        # Row 0: All epochs
-        # First subplot: Total Loss (showing KLD + NLL components)
-        ax = axes[0, 0]
-        for key in loss_keys:
-            color = colors.get(key, 'black')
-            label = labels.get(key, key)
-            ax.plot(all_losses[key], color=color, label=label, linewidth=2)
+    ref_key = available_losses[0] if available_losses else loss_keys[0]
+    recent_start = max(0, len(all_losses[ref_key]) - 100)
+
+    # Create 2x5 subplot layout (Total + up to 4 individual losses)
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+
+    # Row 0: All epochs
+    # Col 0: Total (all losses combined)
+    ax = axes[0, 0]
+    for loss_name in available_losses:
+        color = colors.get(loss_name, 'black')
+        title = titles.get(loss_name, loss_name)
+        ax.plot(all_losses[loss_name], color=color, label=title, linewidth=2)
+    ax.set_xlabel('epoch')
+    ax.set_ylabel('loss')
+    ax.set_title('Total Loss - All Epochs')
+    ax.legend()
+    ax.grid(True)
+
+    # Cols 1-4: Individual losses (up to 4 losses)
+    for i, loss_name in enumerate(available_losses[:4]):
+        ax = axes[0, i + 1]
+        color = colors.get(loss_name, 'black')
+        title = titles.get(loss_name, loss_name)
+        ax.plot(all_losses[loss_name], color=color, linewidth=2)
         ax.set_xlabel('epoch')
         ax.set_ylabel('loss')
-        ax.set_title('Total Loss (Components) - All Epochs')
-        ax.legend()
+        ax.set_title(f'{title} Loss - All Epochs')
         ax.grid(True)
 
-        # Individual component plots (All epochs)
-        for i, key in enumerate(loss_keys):
-            if i < 2:  # KLD and NLL
-                ax = axes[0, i + 1]
-                color = colors.get(key, 'black')
-                title = labels.get(key, key)
-                ax.plot(all_losses[key], color=color, linewidth=2)
-                ax.set_xlabel('epoch')
-                ax.set_ylabel('loss')
-                ax.set_title(f'{title} Loss - All Epochs')
-                ax.grid(True)
+    # Turn off unused subplots in row 0
+    for i in range(min(len(available_losses), 4) + 1, 5):
+        axes[0, i].axis('off')
 
-        # Row 1: Recent 100 epochs
-        # Total Loss (Recent 100)
-        ax = axes[1, 0]
-        for key in loss_keys:
-            color = colors.get(key, 'black')
-            label = labels.get(key, key)
-            recent_vals = all_losses[key][recent_start:]
-            ax.plot(range(recent_start, len(all_losses[key])), recent_vals,
-                   color=color, label=label, linewidth=2)
+    # Row 1: Recent 100 epochs
+    # Col 0: Total (recent)
+    ax = axes[1, 0]
+    for loss_name in available_losses:
+        color = colors.get(loss_name, 'black')
+        title = titles.get(loss_name, loss_name)
+        recent_vals = all_losses[loss_name][recent_start:]
+        ax.plot(range(recent_start, len(all_losses[loss_name])), recent_vals,
+               color=color, label=title, linewidth=2)
+    ax.set_xlabel('epoch')
+    ax.set_ylabel('loss')
+    ax.set_title('Total Loss - Recent 100 Epochs')
+    ax.legend()
+    ax.grid(True)
+
+    # Cols 1-4: Individual losses (recent)
+    for i, loss_name in enumerate(available_losses[:4]):
+        ax = axes[1, i + 1]
+        color = colors.get(loss_name, 'black')
+        title = titles.get(loss_name, loss_name)
+        recent_vals = all_losses[loss_name][recent_start:]
+        ax.plot(range(recent_start, len(all_losses[loss_name])), recent_vals,
+               color=color, linewidth=2)
         ax.set_xlabel('epoch')
         ax.set_ylabel('loss')
-        ax.set_title('Total Loss (Components) - Recent 100 Epochs')
-        ax.legend()
+        ax.set_title(f'{title} Loss - Recent 100 Epochs')
         ax.grid(True)
 
-        # Individual component plots (Recent 100)
-        for i, key in enumerate(loss_keys):
-            if i < 2:  # KLD and NLL
-                ax = axes[1, i + 1]
-                color = colors.get(key, 'black')
-                title = labels.get(key, key)
-                recent_vals = all_losses[key][recent_start:]
-                ax.plot(range(recent_start, len(all_losses[key])), recent_vals,
-                       color=color, linewidth=2)
-                ax.set_xlabel('epoch')
-                ax.set_ylabel('loss')
-                ax.set_title(f'{title} Loss - Recent 100 Epochs')
-                ax.grid(True)
+    # Turn off unused subplots in row 1
+    for i in range(min(len(available_losses), 4) + 1, 5):
+        axes[1, i].axis('off')
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_path, f"loss_{model_name}.png"))
-        plt.close()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, f"loss_{model_name}.png"))
+    plt.close()
 
 
 def train_model(config: Dict[str, Any]) -> nn.Module:
@@ -452,12 +502,8 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
 
     if is_resume:
         # Resume mode: use existing save_path and info
-        resume_info = config['resume_info']
-        save_path = resume_info['save_path']
-        start_epoch = resume_info['epoch']
-        best_loss = resume_info['best_loss']
-        print(f"🔄 Resuming training from epoch {start_epoch}")
-        print(f"📁 Using existing save path: {save_path}")
+        save_path = config['resume_path']
+        start_epoch = config['resume_epoch']
 
         # Ensure subdirectories exist
         os.makedirs(os.path.join(save_path, "anl"), exist_ok=True)
@@ -472,9 +518,10 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
         start_epoch = 0
         best_loss = float('inf')
     
-    # 1-2) save config
+    # 1-2) save config (exclude non-serializable resume data)
+    config_to_save = {k: v for k, v in config.items() if not k.startswith('resume_') and k != 'loaded_model'}
     with open(os.path.join(save_path, "config.json"), 'w') as f:
-        json.dump(config, f, indent=2)
+        json.dump(config_to_save, f, indent=2)
     
     if 'model' in config and 'config_path' in config['model']:
         yaml_config_path = config['model']['config_path']
@@ -488,83 +535,53 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
     train_config = config['train']
 
     if is_resume:
-        # Resume mode: model is already loaded from checkpoint
-        print(f"🔄 Model already loaded from checkpoint")
-        # The model is already in config['resume_info'] but we need to access it differently
-        # We'll create the model and then it will be loaded in the training loop setup
-        pass
-
-    if model_type == 'VRNN':
-        from .models.vrnn import VRNN_ts
-
-        if not is_resume:
-            model = VRNN_ts(
-                x_dim=1,
-                z_dim=model_config.get('z_dim', 1),
-                h_dim=model_config.get('h_dim', 10),
-                n_layers=model_config.get('n_layers', 1),
-                lmbd=model_config.get('lmbd', 0),
-                std_Y=train_config.get('std_Y', 0.01)
-            ).to(DEVICE)
-        else:
-            # Model structure for resume mode
-            model = VRNN_ts(
-                x_dim=1,
-                z_dim=model_config.get('z_dim', 1),
-                h_dim=model_config.get('h_dim', 10),
-                n_layers=model_config.get('n_layers', 1),
-                lmbd=model_config.get('lmbd', 0),
-                std_Y=train_config.get('std_Y', 0.01)
-            ).to(DEVICE)
-
-    elif model_type == 'LS4':
-        from .models.ls4 import LS4_ts, dict2attr
-        # Load LS4 config
-        cfg_path = model_config.get('config_path', 'generative_ts/config/ls4_config.yaml')
-        cfg_all = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
-        cfg_all = dict2attr(cfg_all)
-        ls4_config = cfg_all.model
-
-        # Modify config for our task
-        ls4_config.n_labels = 1
-        ls4_config.classifier = False
-
-        model = LS4_ts(ls4_config).to(DEVICE)
-        # Setup RNN for inference/generation
-        model.setup_rnn(mode='dense')
-
-    elif model_type == 'LatentODE':
-        from .models.latent_ode import LatentODE_ts
-
-        class Config:
-            pass
-
-        config_obj = Config()
-        config_obj.x_dim = 1
-        config_obj.z_dim = model_config.get('latent_dim', 6)
-        config_obj.std_Y = model_config.get('obsrv_std', 0.01)
-        config_obj.rec_dims = model_config.get('rec_dims', 20)
-        config_obj.rec_layers = model_config.get('rec_layers', 1)
-        config_obj.gen_layers = model_config.get('gen_layers', 1)
-        config_obj.units = model_config.get('units', 100)
-        config_obj.gru_units = model_config.get('gru_units', 100)
-        config_obj.z0_encoder = model_config.get('z0_encoder', 'odernn')
-
-        model = LatentODE_ts(config_obj).to(DEVICE)
-
+        # Resume mode: Use already loaded model from config
+        print(f"Using model from checkpoint")
+        model = config['loaded_model']
     else:
-        raise ValueError(f"Unknown model_type: {model_type}")
-    
-    # dataset_path is required
+        # New training mode: Create new model
+        if model_type == 'VRNN':
+            from .models.vrnn import VRNN_ts
+            model = VRNN_ts(**model_config).to(DEVICE)
+
+        elif model_type == 'LS4':
+            from .models.ls4 import LS4_ts, dict2attr
+            # Load LS4 config
+            cfg_path = model_config.get('config_path', 'generative_ts/config/ls4_config.yaml')
+            cfg_all = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
+            cfg_all = dict2attr(cfg_all)
+            ls4_config = cfg_all.model
+
+            # Modify config for our task
+            ls4_config.n_labels = 1
+            ls4_config.classifier = False
+
+            model = LS4_ts(ls4_config).to(DEVICE)
+            # Setup RNN for inference/generation
+            model.setup_rnn(mode='dense')
+
+        elif model_type == 'LatentODE':
+            from .models.latent_ode import LatentODE_ts
+
+            class Config:
+                def __init__(self, **kwargs):
+                    for k, v in kwargs.items():
+                        setattr(self, k, v)
+
+            model = LatentODE_ts(Config(**model_config)).to(DEVICE)
+
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+    # dataset_path is required (move outside of else block)
     dataset_path = config.get('dataset_path')
     if dataset_path is None:
         raise ValueError("dataset_path must be specified in config")
     
-    # Train model using unified train function
-    # Pass resume information if available
     if is_resume:
+        all_losses = config.get('resume_losses', [])
         model = train(model, train_config, save_path, model_type, dataset_path,
-                     resume_info=resume_info, start_epoch=start_epoch)
+                    start_epoch=start_epoch, all_losses=all_losses)
     else:
         model = train(model, train_config, save_path, model_type, dataset_path)
 

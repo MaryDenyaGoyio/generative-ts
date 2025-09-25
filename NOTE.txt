@@ -1,9 +1,6 @@
-250918
+250925
 
-conda activate latentode
-python run.py generative_ts/config/latentode_experiment.json
+TASK
+2) TS를 실제로 해보기 -> 3과 통합되는 framework인 것일지도
 
-
-git add -A
-git commit -m "250918_3"
-git push origin HEAD
+3) long term dynamics -> multistep ELBO / Self-Forcing (Professor Forcing)

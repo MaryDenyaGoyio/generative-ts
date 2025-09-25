@@ -48,7 +48,8 @@ class Decoder_ts(Decoder_ls4):
         self.act = nn.Identity()
 
         # Make sigma a learnable parameter, initialized to provided sigma
-        self.log_sigma = nn.Parameter(torch.log(torch.tensor(sigma)))
+        # self.log_sigma = nn.Parameter(torch.log(torch.tensor(sigma)))
+        self.log_sigma = torch.log(torch.tensor(sigma))
 
         if z_dim != in_channels:
             self.projection = nn.Linear(z_dim, in_channels)
@@ -318,4 +319,70 @@ class LS4_ts(VAE_ls4):
             if verbose > 0:
                 print(f"Batch processing failed: {e}, using sequential fallback")
             return self.posterior_sequential(x_given, T, N, verbose)
+
+    # ------------------------------------------------------------------
+    # Rollout-based NLL for prior rollout penalty
+
+    def _segment_bounds(self, length: int, segments: int):
+        segments = max(1, min(int(segments), length))
+        base = length // segments
+        rem = length % segments
+        bounds = []
+        start = 0
+        for i in range(segments):
+            seg_len = base + (1 if i < rem else 0)
+            end = start + seg_len
+            bounds.append((start, end))
+            start = end
+        return bounds
+
+    def rollout_nll(self, x, timepoints, segments=4):
+        """Compute prior-rollout NLL over masked segments.
+
+        Args:
+            x: (B, T, D) observations
+            timepoints: (T,) time vector used by LS4
+            segments: number of masked segments to evaluate
+        Returns:
+            Scalar tensor (mean NLL across batch) summarising rollout penalty.
+        """
+        device = x.device
+        B, T, D = x.shape
+        bounds = self._segment_bounds(T, segments)
+
+        # constant observation std from decoder
+        sigma = torch.tensor(float(self.decoder.sigma), device=device)
+        total_loss = torch.zeros(B, device=device)
+
+        for start, end in bounds:
+            if end <= start:
+                continue
+            # Need at least one observed point to condition on
+            if start == 0:
+                continue
+
+            x_obs = x[:, :start, :]
+            t_obs = timepoints[:start]
+            t_pred = timepoints[start:end]
+
+            # Use parent's reconstruct to get predictions for masked segment
+            # super().reconstruct expects (B, L_obs, D)
+            pred_full = super().reconstruct(x_obs, t_obs, t_vec_pred=t_pred)
+            if pred_full.shape[1] != (end - start):
+                pred_segment = pred_full[:, - (end - start):, :]
+            else:
+                pred_segment = pred_full
+
+            target = x[:, start:end, :]
+            masks = torch.ones_like(target, device=device)
+            pred_std = sigma * torch.ones_like(target, device=device)
+
+            nll = self._nll_gauss(pred_segment, pred_std, target, masks, sum=True)
+            total_loss += nll
+
+        # If no segments contributed (e.g., very short sequence), return zero
+        if total_loss.numel() == 0:
+            return torch.tensor(0.0, device=device)
+
+        return total_loss.mean()
     

@@ -21,13 +21,14 @@ class VRNN_ts(VRNN):
     3. posterior: extrapolation inference
     """
     
-    def __init__(self, x_dim, z_dim, h_dim, n_layers, lmbd=0, std_Y=0.1, verbose=0):
+    def __init__(self, x_dim, z_dim, h_dim, n_layers, lmbd=0, std_Y=1.0, verbose=0):
         # Initialize original VRNN with adjusted params
         super().__init__(x_dim=x_dim, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers)
         
         # Additional parameters for our modification
         self.lmbd = lmbd  # entropy regularization weight
-        self.log_std_y = nn.Parameter(torch.log(torch.tensor(1.0))) # learnable std_y, init to std_Y
+        # self.log_std_y = nn.Parameter(torch.log(torch.tensor(std_Y))) # learnable std_y, init to std_Y
+        self.log_std_y = torch.log(torch.tensor(1.0))
         self.verbose = verbose
         self.device = DEVICE  # Add device attribute
     
@@ -83,6 +84,73 @@ class VRNN_ts(VRNN):
             'nll_loss': nll_loss, 
             'ent_loss': ent_loss
         }
+
+    def _rollout_segment(self, x, h, start, end, sigma, teacher=False, accumulate=False):
+        loss = torch.tensor(0.0, device=x.device)
+        for t in range(start, end):
+            if teacher:
+                x_t = x[t]
+                phi_x_t = self.phi_x(x_t)
+                enc_input = torch.cat([phi_x_t, h[-1]], dim=1)
+                enc_hidden = self.enc(enc_input)
+                enc_mean = self.enc_mean(enc_hidden)
+                enc_std = self.enc_std(enc_hidden)
+                z_t = enc_mean  # use posterior mean to update state deterministically
+                dec_mean_t = z_t
+                phi_x_input = phi_x_t
+            else:
+                prior_hidden = self.prior(h[-1])
+                prior_mean = self.prior_mean(prior_hidden)
+                prior_std = self.prior_std(prior_hidden)
+                z_t = self._reparameterized_sample(prior_mean, prior_std)
+                dec_mean_t = z_t
+                if accumulate:
+                    dec_std_t = torch.ones_like(dec_mean_t) * sigma
+                    loss = loss + self._nll_gauss(dec_mean_t, dec_std_t, x[t])
+                phi_x_input = self.phi_x(dec_mean_t)
+
+            phi_z_t = self.phi_z(z_t)
+            rnn_input = torch.cat([phi_x_input, phi_z_t], dim=1).unsqueeze(0)
+            _, h = self.rnn(rnn_input, h)
+
+        return loss, h
+
+    def _compute_segments(self, T, num_segments):
+        num_segments = max(1, min(int(num_segments), T))
+        base = T // num_segments
+        remainder = T % num_segments
+        bounds = []
+        start = 0
+        for i in range(num_segments):
+            seg_len = base + (1 if i < remainder else 0)
+            end = start + seg_len
+            bounds.append((start, end))
+            start = end
+        return bounds
+
+    def rollout_nll(self, x, segments=4):
+        """Compute additional NLL term using masked prior rollouts.
+
+        Filtering 모델(VRNN)은 과거 은닉 상태만 이용하므로, 각 구간을
+        prior rollout으로 예측한 뒤 같은 구간을 teacher-forcing으로 다시
+        주입하여 이후 단계에 영향을 주도록 처리한다.
+        """
+        T, B, _ = x.shape
+        sigma = torch.exp(self.log_std_y)
+        total_loss = torch.tensor(0.0, device=x.device)
+        segments_bounds = self._compute_segments(T, segments)
+
+        h = torch.zeros(self.n_layers, B, self.h_dim, device=x.device)
+        for start, end in segments_bounds:
+            chunk_loss, h = self._rollout_segment(
+                x, h, start, end, sigma, teacher=False, accumulate=True
+            )
+            total_loss = total_loss + chunk_loss
+            _, h = self._rollout_segment(
+                x, h, start, end, sigma, teacher=True, accumulate=False
+            )
+
+        return total_loss
     
     def posterior_sample(self, x_given, T):
 

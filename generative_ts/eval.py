@@ -75,7 +75,7 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     time_steps_full = np.arange(T)  # Full sequence (0 to T-1)
     
     # True data (ONLY conditioning part - what the model sees)
-    plt.plot(time_steps_conditioning, y_sample[:t_0], 'b-', linewidth=2, label='Data', alpha=0.8)
+    plt.plot(time_steps_conditioning, y_sample[:t_0], 'b-', linewidth=2, label='Data', alpha=0.5, zorder=3)
     
     # Conditioning boundary (more visible)
     plt.axvline(x=t_0, color='black', linestyle='--', alpha=0.7, linewidth=1.5, label=f'Conditioning boundary (t={t_0})')
@@ -116,18 +116,37 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
             
             if os.path.exists(config_file):
                 ar1_model = AR1_ts(config_path=config_file)
-                ar1_result = ar1_model.posterior(y_sample[:t_0], T, N=1, verbose=0)
-                
+                ar1_result = ar1_model.posterior(y_sample[:t_0], T, N=10, verbose=0)  # Generate some samples
+
                 ar1_mean = ar1_result['mean_samples'].squeeze()
                 ar1_std = ar1_result['var_samples'].squeeze()
-                
-                # AR1 true posterior - prediction region only (T_0 onwards)
+                ar1_samples = ar1_result['x_samples']  # (N, T, 1)
+
+                # AR1 true posterior - conditioning region (T_0 이전, 더 연하게)
+                plt.plot(time_steps_conditioning, ar1_mean[:t_0], 'g--', linewidth=2, alpha=0.4)
+                plt.fill_between(time_steps_conditioning,
+                                ar1_mean[:t_0] - 2*ar1_std[:t_0],
+                                ar1_mean[:t_0] + 2*ar1_std[:t_0],
+                                alpha=0.1, color='green')
+
+                # AR1 true posterior - prediction region (T_0 이후)
                 plt.plot(time_steps_prediction, ar1_mean[t_0:], 'g--', linewidth=2, label='AR1 True Mean', alpha=0.8)
-                plt.fill_between(time_steps_prediction, 
-                                ar1_mean[t_0:] - 2*ar1_std[t_0:], 
-                                ar1_mean[t_0:] + 2*ar1_std[t_0:], 
+                plt.fill_between(time_steps_prediction,
+                                ar1_mean[t_0:] - 2*ar1_std[t_0:],
+                                ar1_mean[t_0:] + 2*ar1_std[t_0:],
                                 alpha=0.2, color='green', label='AR1 True ±2σ')
-                
+
+                # AR1 sample paths (점선으로, T_0 이전은 더 연하게)
+                for i in range(min(5, ar1_samples.shape[0])):  # Show first 5 samples
+                    # Conditioning part (더 연하게)
+                    plt.plot(time_steps_conditioning, ar1_samples[i, :t_0, 0], 'g:', alpha=0.2, linewidth=0.8)
+                    # Prediction part
+                    plt.plot(time_steps_prediction, ar1_samples[i, t_0:, 0], 'g:', alpha=0.4, linewidth=0.8)
+
+                # Add sample path label only once
+                if ar1_samples.shape[0] > 0:
+                    plt.plot([], [], 'g:', alpha=0.4, linewidth=0.8, label=f'AR1 Sample Paths (N={min(5, ar1_samples.shape[0])})')
+
                 pass  # AR1 theoretical posterior added silently
         except Exception as e:
             print(f"Could not add AR1 theoretical posterior: {e}")
