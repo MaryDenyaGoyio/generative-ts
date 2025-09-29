@@ -1,6 +1,2 @@
 250925
 
-TASK
-2) TS를 실제로 해보기 -> 3과 통합되는 framework인 것일지도
-
-3) long term dynamics -> multistep ELBO / Self-Forcing (Professor Forcing)

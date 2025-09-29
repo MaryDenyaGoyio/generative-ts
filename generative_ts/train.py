@@ -326,19 +326,23 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
 
         # Select which losses to display in log (exclude unwanted ones)
         display_losses = []
-        loss_display_order = ['kld_loss', 'kl_loss', 'nll_loss', 'ent_loss', 'rollout_loss_weighted']
-        loss_display_names = {
-            'kld_loss': 'kld_loss',
-            'kl_loss': 'kl_loss',
-            'nll_loss': 'nll_loss',
-            'ent_loss': 'ent_loss',
-            'rollout_loss_weighted': 'rollout_loss'  # Remove "weighted" from display
-        }
 
-        for loss_name in loss_display_order:
-            if loss_name in all_losses and len(all_losses[loss_name]) > epoch:
-                display_name = loss_display_names[loss_name]
-                display_losses.append(f"{display_name}:{all_losses[loss_name][epoch]:.2f}")
+        def append_loss(loss_key, display_label):
+            if loss_key in all_losses and len(all_losses[loss_key]) > epoch:
+                display_losses.append(f"{display_label}:{all_losses[loss_key][epoch]:.2f}")
+                return True
+            return False
+
+        # Prefer kld_loss, fall back to kl_loss if needed
+        if not append_loss('kld_loss', 'kld_loss'):
+            append_loss('kl_loss', 'kl_loss')
+
+        append_loss('nll_loss', 'nll_loss')
+        append_loss('ent_loss', 'ent_loss')
+
+        # Show rollout penalty if available: prefer weighted version, else raw value
+        if not append_loss('rollout_loss_weighted', 'rollout_loss'):
+            append_loss('rollout_loss', 'rollout_loss')
 
         log_msg = f"[{epoch}/{total_epochs}] " + "\t".join(display_losses) + f"  epoch: {elapsed:.2f}s"
         tqdm.write(log_msg)
@@ -405,22 +409,27 @@ def plot_loss(all_losses, save_path, model_name):
         return
 
     # Define loss order and colors
-    loss_order = ['kl_loss', 'kld_loss', 'nll_loss', 'ent_loss', 'rollout_loss_weighted']
+    loss_order = ['kl_loss', 'kld_loss', 'nll_loss', 'ent_loss', 'rollout_loss_weighted', 'rollout_loss']
     colors = {'kl_loss': 'red', 'kld_loss': 'red', 'nll_loss': 'green',
-              'ent_loss': 'blue', 'rollout_loss_weighted': 'purple'}
+              'ent_loss': 'blue', 'rollout_loss_weighted': 'purple', 'rollout_loss': 'purple'}
     titles = {'kl_loss': 'KL', 'kld_loss': 'KL', 'nll_loss': 'NLL',
-              'ent_loss': 'Ent', 'rollout_loss_weighted': 'Rollout'}
+              'ent_loss': 'Ent', 'rollout_loss_weighted': 'Rollout', 'rollout_loss': 'Rollout'}
 
     # Get available losses in order
     available_losses = []
-    for loss_name in loss_order:
+    for loss_name in ['kld_loss', 'kl_loss']:
         if loss_name in loss_keys:
             available_losses.append(loss_name)
             break  # Only take first KL if both kl_loss and kld_loss exist
 
-    for loss_name in ['nll_loss', 'ent_loss', 'rollout_loss_weighted']:
+    for loss_name in ['nll_loss', 'ent_loss']:
         if loss_name in loss_keys:
             available_losses.append(loss_name)
+
+    if 'rollout_loss_weighted' in loss_keys:
+        available_losses.append('rollout_loss_weighted')
+    elif 'rollout_loss' in loss_keys:
+        available_losses.append('rollout_loss')
 
     ref_key = available_losses[0] if available_losses else loss_keys[0]
     recent_start = max(0, len(all_losses[ref_key]) - 100)

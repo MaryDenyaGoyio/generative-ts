@@ -357,9 +357,9 @@ class LatentODE_ts(LatentODE):
             'recon_samples': recon_samples
         }
 
-    def posterior(self, x_given, T, N, verbose=2):
+    def posterior_y(self, x_given, T, N, verbose=2):
         """
-        Adaptive posterior: 배치 처리 우선, 실패시 순차 처리
+        Adaptive posterior: p(x_{1:T} | x_{1:t_0}) - 배치 처리 우선, 실패시 순차 처리
         """
         try:
             return self.posterior_batch(x_given, T, N, verbose)
@@ -367,3 +367,54 @@ class LatentODE_ts(LatentODE):
             if verbose > 0:
                 print(f"LatentODE batch processing failed: {e}, using sequential fallback")
             return self.posterior_sequential(x_given, T, N, verbose)
+
+    def posterior(self, x_given, T, N, verbose=2):
+        """
+        Latent posterior: q(z_0 | x_{1:t_0}) -> z_{1:T}
+        Returns latent state trajectory from posterior initial condition
+        """
+        T_0 = x_given.size(0)
+        device = x_given.device
+
+        # Prepare input with mask (LatentODE expects data+mask concatenated)
+        x_data = x_given.unsqueeze(0).unsqueeze(-1)  # (1, T_0, 1)
+        mask_data = torch.ones_like(x_data)  # (1, T_0, 1)
+        x_with_mask = torch.cat([x_data, mask_data], dim=-1)  # (1, T_0, 2)
+        time_points_obs = torch.linspace(0, 1, T_0, device=device)
+        time_points_full = torch.linspace(0, T_0/T, T, device=device)  # Extend timeline
+
+        z_samples = []
+        z_means = []
+        z_stds = []
+
+        for n in range(N):
+            # Infer initial latent state q(z_0 | x_{1:T_0})
+            z0_mu, z0_std = self.encoder_z0(x_with_mask, time_points_obs, run_backwards=True)
+
+            # Sample z_0 from posterior
+            z0_sample = z0_mu + z0_std * torch.randn_like(z0_std)
+
+            # Generate full trajectory z_{1:T} from z_0 via ODE
+            sol_z = self.diffeq_solver(z0_sample, time_points_full)  # (1, 1, T, latent_dim)
+
+            # Extract trajectory
+            z_traj = sol_z[0, 0, :, :]  # (T, latent_dim)
+
+            z_samples.append(z_traj.cpu().numpy())
+            if n == 0:  # For mean/std computation
+                z_means = z0_mu.expand(T, -1).cpu().numpy()  # Constant posterior mean
+                z_stds = z0_std.expand(T, -1).cpu().numpy()  # Constant posterior std
+
+        z_samples = np.stack(z_samples, axis=0)  # (N, T, latent_dim)
+
+        # For 1D case, squeeze last dimension
+        if z_samples.shape[-1] == 1:
+            z_samples = z_samples.squeeze(-1)
+            z_means = z_means.squeeze(-1) if z_means.ndim > 1 else z_means
+            z_stds = z_stds.squeeze(-1) if z_stds.ndim > 1 else z_stds
+
+        return {
+            'z_samples': z_samples,
+            'z_mean': z_means,
+            'z_std': z_stds
+        }

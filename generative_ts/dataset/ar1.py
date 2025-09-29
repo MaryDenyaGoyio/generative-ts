@@ -236,9 +236,9 @@ class AR1_ts():
 
     # ----------------------- Public API (compat) -----------------------
 
-    def posterior(self, y_given, T, N=20, verbose=2):
+    def posterior_y(self, y_given, T, N=20, verbose=2):
         """
-        COMPATIBLE posterior API.
+        COMPATIBLE posterior API: p(y_{1:T} | y_{<T0})
         Now returns statistics derived from the exact joint Gaussian
         p(y_{1:T} | y_{<T0}), where T0 = len(y_given).
 
@@ -295,4 +295,55 @@ class AR1_ts():
             'recon_samples':recon_samples,     # (N,T0,1)
             'state_mean':   state_mean,        # (T,1)   E[x]
             'state_std':    state_std,         # (T,1)   std[x]
+        }
+
+    def posterior(self, y_given, T, N=20, verbose=2):
+        """
+        Latent posterior API: p(x_{1:T} | y_{<T0})
+        Returns latent state x_t posterior distribution (AR1 hidden states).
+
+        Args:
+            y_given: observed sequence (T_0,)
+            T: total sequence length for output
+            N: number of samples to return
+            verbose: prints small info if >1
+
+        Returns: dict with latent z samples/stats
+        """
+        # Normalize input
+        if isinstance(y_given, torch.Tensor):
+            y_given = y_given.detach().cpu().numpy()
+        elif isinstance(y_given, list):
+            y_given = np.array(y_given)
+        if y_given.ndim > 1:
+            y_given = y_given.flatten()
+
+        T0 = len(y_given)
+
+        # Get joint distribution: both observation and latent
+        mu_y, Sigma_y, mu_x, Sigma_x = self._joint_y_given_prefix(y_given, T)
+
+        # Sample from latent posterior p(x_{1:T} | y_{1:T0})
+        x_samples = []
+        try:
+            # Multivariate normal sampling from latent posterior
+            for _ in range(N):
+                x_sample = np.random.multivariate_normal(mu_x, Sigma_x)
+                x_samples.append(x_sample)
+            x_samples = np.array(x_samples)  # (N, T)
+        except np.linalg.LinAlgError:
+            # Fallback: diagonal approximation
+            x_std = np.sqrt(np.clip(np.diag(Sigma_x), a_min=1e-8, a_max=None))
+            x_samples = np.random.normal(
+                mu_x[None, :], x_std[None, :], size=(N, T)
+            )
+
+        # Latent state statistics
+        x_mean = mu_x  # (T,)
+        x_std = np.sqrt(np.clip(np.diag(Sigma_x), a_min=1e-8, a_max=None))  # (T,)
+
+        return {
+            'z_samples': x_samples,  # (N, T) - latent state samples
+            'z_mean': x_mean,        # (T,) - latent state mean
+            'z_std': x_std,          # (T,) - latent state std
         }

@@ -71,6 +71,13 @@ The main development occurs in `_generative_ts/` and `train_gp_ls4.py`, which co
 2) **Environment pinning**
    - Always `conda activate ls4` for LS4, `conda activate vrnn` for VRNN (or `conda run -n <env> ...`).
 
+3) **Commenting rules**
+   - Keep comments as short as possible; prefer mathematical notation and avoid full sentences where feasible.
+   - Never remove user-authored banner comments such as `# ---------------- 0) get model, data ----------------`.
+
+4) **Code style**
+   - Write the most concise code that satisfies the requirements, minimize duplication, and share logic aggressively across features.
+
 ---
 
 ## Model Architecture Notes

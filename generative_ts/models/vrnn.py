@@ -21,14 +21,14 @@ class VRNN_ts(VRNN):
     3. posterior: extrapolation inference
     """
     
-    def __init__(self, x_dim, z_dim, h_dim, n_layers, lmbd=0, std_Y=1.0, verbose=0):
+    def __init__(self, x_dim, z_dim, h_dim, n_layers, lmbd=0, std_Y=0.01, verbose=0):
         # Initialize original VRNN with adjusted params
         super().__init__(x_dim=x_dim, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers)
         
         # Additional parameters for our modification
         self.lmbd = lmbd  # entropy regularization weight
         # self.log_std_y = nn.Parameter(torch.log(torch.tensor(std_Y))) # learnable std_y, init to std_Y
-        self.log_std_y = torch.log(torch.tensor(1.0))
+        self.log_std_y = torch.log(torch.tensor(std_Y))
         self.verbose = verbose
         self.device = DEVICE  # Add device attribute
     
@@ -397,9 +397,9 @@ class VRNN_ts(VRNN):
                 'recon_samples': recon_samples
             }
 
-    def posterior(self, x_given, T, N, verbose=2):
+    def posterior_y(self, x_given, T, N, verbose=2):
         """
-        Adaptive posterior: 배치 처리 우선, 실패시 순차 처리
+        Adaptive posterior: p(x_{1:T} | x_{1:t_0}) - 배치 처리 우선, 실패시 순차 처리
         """
         try:
             return self.posterior_batch(x_given, T, N, verbose)
@@ -407,6 +407,74 @@ class VRNN_ts(VRNN):
             if verbose > 0:
                 print(f"VRNN batch processing failed: {e}, using sequential fallback")
             return self.posterior_sequential(x_given, T, N, verbose)
+
+    def posterior(self, x_given, T, N, verbose=2):
+        """
+        Latent posterior: q(z_{1:T} | x_{1:t_0})
+        Returns latent state posterior distribution
+        """
+        T_0 = x_given.size(0)
+
+        z_samples = []
+        z_means = []
+        z_stds = []
+
+        device = x_given.device
+
+        for n in range(N):
+            z_traj_means = []
+            z_traj_stds = []
+            z_traj_samples = []
+
+            h = torch.zeros(self.n_layers, 1, self.h_dim, device=device)
+
+            for t in range(T):
+                if t < T_0:
+                    # Conditioning phase: use encoder q(z_t | x_t, h_{t-1})
+                    x_t = x_given[t].unsqueeze(0) if x_given[t].dim() == 1 else x_given[t]
+                    phi_x_t = self.phi_x(x_t)
+                    enc_t = self.enc(torch.cat([phi_x_t, h[-1]], 1))
+                    enc_mean_t = self.enc_mean(enc_t)
+                    enc_std_t = self.enc_std(enc_t)
+                    z_t = self._reparameterized_sample(enc_mean_t, enc_std_t)
+
+                    z_traj_means.append(enc_mean_t)
+                    z_traj_stds.append(enc_std_t)
+                    z_traj_samples.append(z_t)
+
+                    # Update state with actual observation
+                    phi_z_t = self.phi_z(z_t)
+                    _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
+                else:
+                    # Prediction phase: use prior p(z_t | h_{t-1})
+                    prior_t = self.prior(h[-1])
+                    prior_mean_t = self.prior_mean(prior_t)
+                    prior_std_t = self.prior_std(prior_t)
+                    z_t = self._reparameterized_sample(prior_mean_t, prior_std_t)
+
+                    z_traj_means.append(prior_mean_t)
+                    z_traj_stds.append(prior_std_t)
+                    z_traj_samples.append(z_t)
+
+                    # Update state with sampled observation
+                    x_sample = z_t  # In VRNN, x ≈ z
+                    phi_x_t = self.phi_x(x_sample)
+                    phi_z_t = self.phi_z(z_t)
+                    _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
+
+            # Collect trajectory
+            z_samples.append(torch.stack(z_traj_samples, dim=0).squeeze())
+            if n == 0:  # For mean/std computation
+                z_means = torch.stack(z_traj_means, dim=0).squeeze()
+                z_stds = torch.stack(z_traj_stds, dim=0).squeeze()
+
+        z_samples = torch.stack(z_samples, dim=0)  # (N, T)
+
+        return {
+            'z_samples': z_samples.cpu().numpy(),
+            'z_mean': z_means.cpu().numpy(),
+            'z_std': z_stds.cpu().numpy()
+        }
     
     def _entropy_gauss(self, std):
         """Gaussian entropy: 0.5 * log(2πe * σ²)"""

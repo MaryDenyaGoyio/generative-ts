@@ -25,7 +25,7 @@ class GP():
         """Set a fixed theta_fixed value to use for all data generation"""
         self._fixed_theta_value = theta_value
     
-    def data(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    def data(self) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
 
         # e_t + θ^fixed + θ^GP_t
         noise_Y = np.random.normal(loc=0.0, scale=self.std_Y, size=self.T)
@@ -35,13 +35,17 @@ class GP():
             theta_fixed = self._fixed_theta_value
         else:
             theta_fixed = np.random.normal(loc=0.0, scale=self.v)
-        
+
         self._theta_fixed = theta_fixed  # Store for potential use in posterior
 
         theta_gp = GaussianProcessRegressor(kernel=C(self.sigma_f**2) * RBF(length_scale=self.tau), alpha=1e-10).sample_y(np.arange(self.T).reshape(-1, 1), random_state=None).flatten()
 
+        theta = theta_fixed + theta_gp  # Latent state
+        Y = theta + noise_Y  # Observation
+
         return (
-                    (theta_fixed + theta_gp + noise_Y).reshape(self.T, 1),
+                    Y.reshape(self.T, 1),
+                    theta.reshape(self.T, 1),
                     {
                         r"\epsilon_{a,t}"         : noise_Y,
                         r"\theta^{\text{fixed}}_{a}" : theta_fixed,
@@ -63,25 +67,26 @@ class AR1():
         prms = ["T", "std_Y", "phi", "sigma"]
         self.T, self.std_Y, self.phi, self.sigma = [kwargs[prm] for prm in prms]
         
-    def data(self) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    def data(self) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
         """Generate one AR1 sequence"""
-        # Generate AR1 process
-        x = np.zeros(self.T)
+        # Generate AR1 process (latent state theta)
+        theta = np.zeros(self.T)
         # Stationary initial condition
-        x[0] = np.random.normal(0, self.sigma / np.sqrt(1 - self.phi**2))
-        
+        theta[0] = np.random.normal(0, self.sigma / np.sqrt(1 - self.phi**2))
+
         for t in range(1, self.T):
-            x[t] = self.phi * x[t-1] + np.random.normal(0, self.sigma)
-        
+            theta[t] = self.phi * theta[t-1] + np.random.normal(0, self.sigma)
+
         # Add observation noise
         noise_Y = np.random.normal(0, self.std_Y, self.T)
-        y = x + noise_Y
-        
+        Y = theta + noise_Y
+
         return (
-            y.reshape(self.T, 1),
+            Y.reshape(self.T, 1),
+            theta.reshape(self.T, 1),
             {
                 r"\epsilon_{a,t}": noise_Y,
-                r"x_{AR1,t}": x,
+                r"x_{AR1,t}": theta,
                 "phi": self.phi,
                 "sigma": self.sigma
             }
@@ -130,66 +135,74 @@ def generate_gp_dataset(config_path, n_samples=10000, save_dir=None):
     print(f"  Fixed theta_fixed value: {theta_fixed:.6f}")
     
     # Generate samples
-    samples = []
+    samples_Y = []
+    samples_theta = []
     print(f"Generating samples...")
-    
+
     for i in range(n_samples):
         if (i + 1) % 1000 == 0:
             print(f"  Generated {i + 1}/{n_samples} samples")
-        
+
         # Generate only GP component and noise, use fixed theta_fixed
         noise_Y = np.random.normal(loc=0.0, scale=data_config['std_Y'], size=data_config['T'])
-        
+
         theta_gp = GaussianProcessRegressor(
-            kernel=C(data_config['sigma_f']**2) * RBF(length_scale=data_config['tau']), 
+            kernel=C(data_config['sigma_f']**2) * RBF(length_scale=data_config['tau']),
             alpha=1e-10
         ).sample_y(np.arange(data_config['T']).reshape(-1, 1), random_state=None).flatten()
-        
-        Y = (theta_fixed + theta_gp + noise_Y).reshape(data_config['T'], 1)
-        samples.append(Y.squeeze())  # (T,)
-    
-    # Convert to numpy array
-    samples = np.stack(samples, axis=0)  # (N, T)
-    print(f"Dataset shape: {samples.shape}")
-    print(f"Mean: {samples.mean():.4f}, Std: {samples.std():.4f}")
-    print(f"Min: {samples.min():.4f}, Max: {samples.max():.4f}")
-    
-    # Save dataset
-    np.save(save_dir / "samples.npy", samples)
+
+        theta = theta_fixed + theta_gp  # Latent state
+        Y = theta + noise_Y  # Observation
+
+        samples_Y.append(Y)  # (T,)
+        samples_theta.append(theta)  # (T,)
+
+    # Convert to numpy arrays
+    samples_Y = np.stack(samples_Y, axis=0)  # (N, T)
+    samples_theta = np.stack(samples_theta, axis=0)  # (N, T)
+    print(f"Dataset shape: Y={samples_Y.shape}, theta={samples_theta.shape}")
+    print(f"Y - Mean: {samples_Y.mean():.4f}, Std: {samples_Y.std():.4f}")
+    print(f"theta - Mean: {samples_theta.mean():.4f}, Std: {samples_theta.std():.4f}")
+
+    # Save datasets
+    np.save(save_dir / "outcome_Y.npy", samples_Y)
+    np.save(save_dir / "latent_theta.npy", samples_theta)
     
     # Save config
     with open(save_dir / "config.json", 'w') as f:
         json.dump({
             "data": data_config,
             "n_samples": n_samples,
-            "dataset_shape": list(samples.shape),
+            "dataset_shape_Y": list(samples_Y.shape),
+            "dataset_shape_theta": list(samples_theta.shape),
             "theta_fixed_value": float(theta_fixed),
             "statistics": {
-                "mean": float(samples.mean()),
-                "std": float(samples.std()),
-                "min": float(samples.min()),
-                "max": float(samples.max())
+                "Y_mean": float(samples_Y.mean()),
+                "Y_std": float(samples_Y.std()),
+                "theta_mean": float(samples_theta.mean()),
+                "theta_std": float(samples_theta.std())
             }
         }, f, indent=2)
-    
+
     # Save original experiment config for reference
     with open(save_dir / "original_experiment_config.json", 'w') as f:
         json.dump(config, f, indent=2)
-    
+
     # Create test/train split (same format as AR1)
     data_dict = {
-        'Y_test': samples.tolist(),
+        'Y_test': samples_Y.tolist(),
+        'theta_test': samples_theta.tolist(),
         'config': {"data": data_config}
     }
     torch.save(data_dict, save_dir / "data.pth")
 
-    print(f"✅ Dataset generated successfully!")
-    print(f"   Samples: {save_dir}/samples.npy")
+    print(f"Dataset generated successfully!")
+    print(f"   Y: {save_dir}/outcome_Y.npy")
+    print(f"   theta: {save_dir}/latent_theta.npy")
     print(f"   Config: {save_dir}/config.json")
     print(f"   Data: {save_dir}/data.pth")
-    print(f"   Original config: {save_dir}/original_experiment_config.json")
-    
-    return save_dir, samples
+
+    return save_dir, samples_Y, samples_theta
 
 
 def generate_ar1_dataset(config_path, n_samples=10000, save_dir=None):
@@ -222,58 +235,64 @@ def generate_ar1_dataset(config_path, n_samples=10000, save_dir=None):
     ar1_gen = AR1(**data_config)
     
     # Generate samples
-    samples = []
+    samples_Y = []
+    samples_theta = []
     print(f"Generating samples...")
-    
+
     for i in range(n_samples):
         if (i + 1) % 1000 == 0:
             print(f"  Generated {i + 1}/{n_samples} samples")
-        
-        Y, _ = ar1_gen.data()
-        samples.append(Y.squeeze())  # (T,)
-    
-    # Convert to numpy array
-    samples = np.stack(samples, axis=0)  # (N, T)
-    print(f"Dataset shape: {samples.shape}")
-    print(f"Mean: {samples.mean():.4f}, Std: {samples.std():.4f}")
-    print(f"Min: {samples.min():.4f}, Max: {samples.max():.4f}")
-    
-    # Save dataset
-    np.save(save_dir / "samples.npy", samples)
+
+        Y, theta, _ = ar1_gen.data()
+        samples_Y.append(Y.squeeze())  # (T,)
+        samples_theta.append(theta.squeeze())  # (T,)
+
+    # Convert to numpy arrays
+    samples_Y = np.stack(samples_Y, axis=0)  # (N, T)
+    samples_theta = np.stack(samples_theta, axis=0)  # (N, T)
+    print(f"Dataset shape: Y={samples_Y.shape}, theta={samples_theta.shape}")
+    print(f"Y - Mean: {samples_Y.mean():.4f}, Std: {samples_Y.std():.4f}")
+    print(f"theta - Mean: {samples_theta.mean():.4f}, Std: {samples_theta.std():.4f}")
+
+    # Save datasets
+    np.save(save_dir / "outcome_Y.npy", samples_Y)
+    np.save(save_dir / "latent_theta.npy", samples_theta)
     
     # Save config
     with open(save_dir / "config.json", 'w') as f:
         json.dump({
             "data": data_config,
             "n_samples": n_samples,
-            "dataset_shape": list(samples.shape),
+            "dataset_shape_Y": list(samples_Y.shape),
+            "dataset_shape_theta": list(samples_theta.shape),
             "statistics": {
-                "mean": float(samples.mean()),
-                "std": float(samples.std()),
-                "min": float(samples.min()),
-                "max": float(samples.max())
+                "Y_mean": float(samples_Y.mean()),
+                "Y_std": float(samples_Y.std()),
+                "theta_mean": float(samples_theta.mean()),
+                "theta_std": float(samples_theta.std())
             }
         }, f, indent=2)
-    
+
     # Create test/train split (same format as GP)
     data_dict = {
-        'Y_test': samples.tolist(),
+        'Y_test': samples_Y.tolist(),
+        'theta_test': samples_theta.tolist(),
         'config': {"data": data_config}
     }
-    
+
     torch.save(data_dict, save_dir / "data.pth")
-    
+
     # Save original experiment config for reference
     with open(save_dir / "original_experiment_config.json", 'w') as f:
         json.dump(config, f, indent=2)
-    
-    print(f"✅ AR1 Dataset generated successfully!")
-    print(f"   Samples: {save_dir}/samples.npy")
+
+    print(f"AR1 Dataset generated successfully!")
+    print(f"   Y: {save_dir}/outcome_Y.npy")
+    print(f"   theta: {save_dir}/latent_theta.npy")
     print(f"   Config: {save_dir}/config.json")
     print(f"   Data: {save_dir}/data.pth")
-    print(f"   Original config: {save_dir}/original_experiment_config.json")
-    
-    return save_dir, samples
+
+    return save_dir, samples_Y, samples_theta
 
 
 if __name__ == "__main__":

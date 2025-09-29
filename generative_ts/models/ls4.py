@@ -309,9 +309,9 @@ class LS4_ts(VAE_ls4):
                 'recon_samples': recon_samples
             }
 
-    def posterior(self, x_given, T, N, verbose=2):
+    def posterior_y(self, x_given, T, N, verbose=2):
         """
-        Adaptive posterior: 배치 처리 우선, 실패시 순차 처리
+        Adaptive posterior: p(x_{1:T} | x_{1:t_0}) - 배치 처리 우선, 실패시 순차 처리
         """
         try:
             return self.posterior_batch(x_given, T, N, verbose)
@@ -319,6 +319,67 @@ class LS4_ts(VAE_ls4):
             if verbose > 0:
                 print(f"Batch processing failed: {e}, using sequential fallback")
             return self.posterior_sequential(x_given, T, N, verbose)
+
+    def posterior(self, x_given, T, N, verbose=2):
+        """
+        Latent posterior: q(z_{1:T} | x_{1:t_0})
+        Returns latent state posterior distribution
+        """
+        T_0 = x_given.size(0)
+        device = x_given.device
+
+        # Prepare input
+        x_input = x_given.unsqueeze(0).unsqueeze(-1)  # (1, T_0, 1)
+        t_vec = torch.arange(T_0, dtype=torch.float32, device=device)
+
+        z_samples = []
+        z_means = []
+        z_stds = []
+
+        for n in range(N):
+            # Get encoder posterior q(z_{1:T_0} | x_{1:T_0})
+            z_post, z_post_mean, z_post_std = self.encoder.encode(x_input, t_vec, use_forward=True)
+
+            # For prediction phase (T_0:T), use decoder's latent model for prior rollout
+            if T > T_0:
+                # Extend latent sequence with prior rollout
+                z_pred_samples = []
+                z_pred_means = []
+                z_pred_stds = []
+
+                # Initialize with last posterior state
+                z_last = z_post[:, -1:, :]  # (1, 1, latent_dim)
+
+                for t in range(T_0, T):
+                    # Sample from prior p(z_t | z_{<t})
+                    # Use decoder's latent model
+                    z_pred, z_pred_mean, z_pred_std = self.decoder.latent.step(z_last)
+                    z_pred_samples.append(z_pred)
+                    z_pred_means.append(z_pred_mean)
+                    z_pred_stds.append(z_pred_std)
+                    z_last = z_pred
+
+                # Combine posterior and prior
+                z_full_sample = torch.cat([z_post, torch.cat(z_pred_samples, dim=1)], dim=1)
+                z_full_mean = torch.cat([z_post_mean, torch.cat(z_pred_means, dim=1)], dim=1)
+                z_full_std = torch.cat([z_post_std, torch.cat(z_pred_stds, dim=1)], dim=1)
+            else:
+                z_full_sample = z_post
+                z_full_mean = z_post_mean
+                z_full_std = z_post_std
+
+            z_samples.append(z_full_sample.squeeze().cpu().numpy())
+            if n == 0:  # For mean/std computation
+                z_means = z_full_mean.squeeze().cpu().numpy()
+                z_stds = z_full_std.squeeze().cpu().numpy()
+
+        z_samples = np.stack(z_samples, axis=0)  # (N, T, latent_dim) or (N, T)
+
+        return {
+            'z_samples': z_samples,
+            'z_mean': z_means,
+            'z_std': z_stds
+        }
 
     # ------------------------------------------------------------------
     # Rollout-based NLL for prior rollout penalty
@@ -351,8 +412,8 @@ class LS4_ts(VAE_ls4):
         bounds = self._segment_bounds(T, segments)
 
         # constant observation std from decoder
-        sigma = torch.tensor(float(self.decoder.sigma), device=device)
-        total_loss = torch.zeros(B, device=device)
+        sigma = torch.exp(self.decoder.log_sigma).to(device=device, dtype=x.dtype)
+        loss_terms = []
 
         for start, end in bounds:
             if end <= start:
@@ -374,15 +435,15 @@ class LS4_ts(VAE_ls4):
                 pred_segment = pred_full
 
             target = x[:, start:end, :]
-            masks = torch.ones_like(target, device=device)
-            pred_std = sigma * torch.ones_like(target, device=device)
+            masks = torch.ones_like(target)
+            pred_std = sigma * torch.ones_like(target)
 
             nll = self._nll_gauss(pred_segment, pred_std, target, masks, sum=True)
-            total_loss += nll
+            loss_terms.append(nll)
 
-        # If no segments contributed (e.g., very short sequence), return zero
-        if total_loss.numel() == 0:
-            return torch.tensor(0.0, device=device)
+        if not loss_terms:
+            return x.new_zeros(())
 
+        total_loss = torch.stack(loss_terms, dim=0).sum(dim=0)
         return total_loss.mean()
     

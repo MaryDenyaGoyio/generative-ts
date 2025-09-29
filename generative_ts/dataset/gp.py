@@ -380,24 +380,24 @@ class GP_ts():
         
         return Y_samples
     
-    def posterior(self, Y_given, T, N=20, verbose=2):
+    def posterior_y(self, Y_given, T, N=20, verbose=2):
         """
         Exact GP posterior: p(Y_{>t} | Y_{≤t}) using the provided mathematical formulation
-        
+
         Based on the joint distribution:
-        [Y_{≤t}; Y_{>t}] ~ N([m_{≤t}; m_{>t}], [K_{≤t,≤t}+σ²I+σ²_fix·11ᵀ, K_{>t,≤t}+σ²_fix·11ᵀ; 
+        [Y_{≤t}; Y_{>t}] ~ N([m_{≤t}; m_{>t}], [K_{≤t,≤t}+σ²I+σ²_fix·11ᵀ, K_{>t,≤t}+σ²_fix·11ᵀ;
                                               (K_{>t,≤t}+σ²_fix·11ᵀ)ᵀ, K_{>t,>t}+σ²I+σ²_fix·11ᵀ])
-        
+
         Args:
-            Y_given: observed data Y_{≤t} (t+1,) or (t+1, 1, 1) 
+            Y_given: observed data Y_{≤t} (t+1,) or (t+1, 1, 1)
             T: total sequence length for prediction
             N: number of samples (for compatibility with other models)
             verbose: verbosity level
-            
+
         Returns:
             result: dict containing:
                 - mean_samples: (T, 1) exact posterior mean for entire sequence
-                - var_samples: (T, 1) exact posterior std for entire sequence  
+                - var_samples: (T, 1) exact posterior std for entire sequence
                 - x_samples: (N, T, 1) samples for entire sequence
                 - recon_mean: (t+1, 1) exact reconstruction mean
                 - recon_std: (t+1, 1) exact reconstruction std
@@ -575,6 +575,117 @@ class GP_ts():
             'mean_samples': full_mean,      # (T, 1) - exact means
             'var_samples': full_std,        # (T, 1) - exact stds
             'x_samples': full_samples,      # (N, T, 1) - samples
+        }
+
+    def posterior(self, Y_given, T, N=20, verbose=2):
+        """
+        Latent posterior API: p(θ_{1:T} | Y_{≤t})
+        Returns latent function values θ_t posterior distribution (GP function values).
+
+        In GP model:
+        - latent state: θ_t ~ GP(θ_fixed, k(t,t'))
+        - observation: Y_t = θ_t + ε_t, ε_t ~ N(0, σ²_Y)
+
+        Args:
+            Y_given: observed data Y_{≤t} (t+1,) or (t+1, 1, 1)
+            T: total sequence length for output
+            N: number of samples to return
+            verbose: verbosity level
+
+        Returns: dict with latent θ samples/stats
+        """
+        # Handle input shapes
+        if isinstance(Y_given, torch.Tensor):
+            Y_given = Y_given.detach().cpu().numpy()
+        if Y_given.ndim > 1:
+            Y_given = Y_given.flatten()
+
+        t_obs = len(Y_given)
+
+        # For GP, latent posterior is θ_t | Y_{≤t} without observation noise
+        # Unlike posterior_y which includes Y = θ + noise
+
+        # Time points
+        t_range = np.arange(T)
+        t_given = np.arange(t_obs)
+        t_pred = np.arange(t_obs, T) if T > t_obs else np.array([])
+
+        # Kernel matrices for latent θ (no observation noise)
+        K_given_given = self.kernel(t_given, t_given)
+        K_pred_given = self.kernel(t_pred, t_given) if len(t_pred) > 0 else np.array([]).reshape(0, t_obs)
+        K_pred_pred = self.kernel(t_pred, t_pred) if len(t_pred) > 0 else np.array([]).reshape(0, 0)
+
+        # Mean vectors
+        m_given = self.theta_fixed * np.ones(t_obs)
+        m_pred = self.theta_fixed * np.ones(len(t_pred))
+
+        # Latent posterior for conditioning region
+        theta_means_given = []
+        theta_stds_given = []
+
+        for i in range(t_obs):
+            # Posterior of θ_i | Y_{≤i}
+            t_cond = t_given[:i+1]
+            Y_cond = Y_given[:i+1]
+
+            if len(t_cond) == 1:
+                # First timestep: θ_0 | Y_0
+                # Y_0 = θ_0 + ε → θ_0 | Y_0 ~ N(posterior_mean, posterior_var)
+                prior_var = self.kernel(t_cond, t_cond)[0, 0] + self.v
+                obs_var = self.sigma_Y ** 2
+                posterior_var = 1.0 / (1.0/prior_var + 1.0/obs_var)
+                posterior_mean = posterior_var * (self.theta_fixed/prior_var + Y_cond[0]/obs_var)
+            else:
+                # Multi-step conditioning
+                K_cond = self.kernel(t_cond, t_cond) + self.v * np.ones((len(t_cond), len(t_cond)))
+                K_obs = K_cond + (self.sigma_Y ** 2) * np.eye(len(t_cond))
+
+                # Posterior: θ_i | Y_{≤i}
+                # p(θ_i | Y_{≤i}) using GP conditioning formula
+                k_i = self.kernel(np.array([t_cond[i]]), t_cond[:-1]).flatten()
+                k_ii = self.kernel(np.array([t_cond[i]]), np.array([t_cond[i]]))[0, 0] + self.v
+
+                if len(t_cond) > 1:
+                    K_inv = np.linalg.solve(K_obs[:-1, :-1], np.eye(len(t_cond)-1))
+                    posterior_mean = self.theta_fixed + k_i @ K_inv @ (Y_cond[:-1] - self.theta_fixed)
+                    posterior_var = k_ii - k_i @ K_inv @ k_i
+                else:
+                    posterior_mean = self.theta_fixed
+                    posterior_var = k_ii
+
+            theta_means_given.append(posterior_mean)
+            theta_stds_given.append(np.sqrt(max(posterior_var, 1e-8)))
+
+        # Latent posterior for prediction region (if any)
+        if len(t_pred) > 0:
+            # θ_{>t} | Y_{≤t} using GP conditioning
+            K_obs = K_given_given + self.v * np.ones((t_obs, t_obs)) + (self.sigma_Y ** 2) * np.eye(t_obs)
+            K_inv = np.linalg.solve(K_obs, np.eye(t_obs))
+
+            posterior_mean_pred = m_pred + K_pred_given @ K_inv @ (Y_given - m_given)
+            posterior_cov_pred = K_pred_pred + self.v * np.ones((len(t_pred), len(t_pred))) - K_pred_given @ K_inv @ K_pred_given.T
+            posterior_std_pred = np.sqrt(np.maximum(np.diag(posterior_cov_pred), 1e-8))
+        else:
+            posterior_mean_pred = np.array([])
+            posterior_std_pred = np.array([])
+
+        # Combine conditioning + prediction
+        theta_means = np.concatenate([theta_means_given, posterior_mean_pred])
+        theta_stds = np.concatenate([theta_stds_given, posterior_std_pred])
+
+        # Generate samples
+        theta_samples = []
+        for _ in range(N):
+            # Sample from latent posterior
+            theta_sample = np.random.normal(theta_means, theta_stds)
+            theta_samples.append(theta_sample)
+
+        theta_samples = np.array(theta_samples)  # (N, T)
+
+        return {
+            'z_samples': theta_samples,  # (N, T) - latent θ samples
+            'z_mean': theta_means,       # (T,) - latent θ mean
+            'z_std': theta_stds,         # (T,) - latent θ std
         }
     
     def compute_elbo_terms(self, Y_sequence, return_trajectory=False):
