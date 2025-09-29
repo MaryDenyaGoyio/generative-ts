@@ -8,95 +8,7 @@ from datetime import datetime
 
 def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None, idx=0, ratio=0.5, N_samples = 100):
 
-
-    # ---------------- 0) get model, data ----------------
-    if model_name is None:  model_name = model.__class__.__name__
-    if hasattr(model, 'eval'):  model.eval()
-
-    data_file = os.path.join(dataset_path, 'data.pth')
-    data = torch.load(data_file, weights_only=False)
-    Y_test, t_test = data['Y_test'], data.get('t_test', None)
-
-    y_sample = Y_test[idx]
-    t_sample = t_test[idx] if t_test is not None else np.arange(len(y_sample))
-
-    T = len(y_sample)
-    t_0 = int(ratio * T)
-
-    print(f"Sample {idx}: T_data={T}, t_0={t_0}, T={T}, N={N_samples}")
-
-
-    # ---------------- 1) call posterior ----------------
-    with torch.no_grad():
-        device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
-        y_given = torch.tensor(y_sample[:t_0], dtype=torch.float32, device=device)
-
-        # Get data posterior model
-        config_path = os.path.join(dataset_path, 'config.json')
-        if dataset_path and 'ar1' in dataset_path.lower():
-            from .dataset.ar1 import AR1_ts
-            data_model = AR1_ts(config_path=config_path)
-        elif dataset_path and 'gp' in dataset_path.lower():
-            from .dataset.gp import GP_ts
-            data_model = GP_ts(config_path=config_path)
-
-        
-        y_model_input = y_given.unsqueeze(-1).unsqueeze(1) if y_given.dim() == 1 else y_given.unsqueeze(1) if y_given.dim() == 2 else y_given # Model input (T_0, 1, 1)
-        y_data_input = y_given.squeeze() if y_given.dim() > 1 else y_given # Data model inpur (T_0,)
-
-        post_model = model.posterior_y(y_model_input, T, N=N_samples)
-        post_data = data_model.posterior_y(y_data_input, T, N=N_samples)
-    
-
-    # ---------------- 2) make posterior plot ----------------   
-    plt.figure(figsize=(12, 6))
-    time_t_0 = np.arange(t_0) 
-    time_t_0_to_T = np.arange(t_0, T)
-    time_T = np.arange(T)
-    
-    # Y_{:t_0}
-    plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=2, label='Data', alpha=0.5, zorder=3)
-    plt.axvline(x=t_0, color='black', linestyle='--', alpha=0.7, linewidth=1.5, label=f'(t={t_0})')
-    
-    for c, post in {'r' : post_model, 'g' : post_data}.items():
-
-        # Y'_{:T} | Y_{:t_0}
-        samples = post['x_samples']
-        for i in range(min(10, N_samples)):
-            plt.plot(time_T, samples[i].squeeze(), c, alpha=0.2, linewidth=0.8)
-        if N_samples > 0:   plt.plot([], [], c, alpha=0.2, linewidth=0.8, label=f"$Y'_{{\\leq T}} | Y_{{\\leq T_0}}$ ($N={min(10, N_samples)}$)")
-
-        # E[Y_{:T} | Y_{:t_0}]
-        mean_traj = post['mean_samples'].squeeze()
-        std_traj = post['var_samples'].squeeze()
-
-        plt.plot(time_T, mean_traj, c + '-', linewidth=2, label=f"$\\mathrm{{E}}[Y_{{\\leq T}} | Y_{{\\leq T_0}}]$")
-
-        # Var[Y_{:T} | Y_{:t_0}]
-        plt.fill_between(time_T,
-                        mean_traj - 2*std_traj,
-                        mean_traj + 2*std_traj,
-                        alpha=0.3, color=c, label=f"$\\mathrm{{E}}[Y_{{\\leq T}} | Y_{{\\leq T_0}}] \\pm \\text{{Var}}[Y_{{\\leq T}} | Y_{{\\leq T_0}}]$")
-    
-
-    plt.xlabel('Time')
-    plt.ylabel('Latent State')
-    plt.title(f'Posterior plot_{model_name}_{epoch}_{N_samples}samples')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    try:    plt.tight_layout()
-    except Exception:   pass
-    
-    # Save
-    os.makedirs(save_path, exist_ok=True)
-    save_file = os.path.join(save_path, f'posterior_{model_name}_{epoch}_{N_samples}samples.png')
-    plt.savefig(save_file, dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-
-
-def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, idx=0, ratio=0.5, N_samples=100):
+    posts = {}
 
     # ---------------- 0) get model, data ----------------
     if model_name is None:  model_name = model.__class__.__name__
@@ -123,21 +35,129 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
         device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
         y_given = torch.tensor(y_sample[:t_0], dtype=torch.float32, device=device)
 
-        # Get data posterior model
-        config_path = os.path.join(dataset_path, 'config.json')
-        if dataset_path and 'ar1' in dataset_path.lower():
-            from .dataset.ar1 import AR1_ts
-            data_model = AR1_ts(config_path=config_path)
-        elif dataset_path and 'gp' in dataset_path.lower():
-            from .dataset.gp import GP_ts
-            data_model = GP_ts(config_path=config_path)
+        if model_name.lower().replace('_ts','') in ['vrnn', 'lode', 'ls4']:
+            # Get data posterior model
+            config_path = os.path.join(dataset_path, 'config.json')
+            if dataset_path and 'ar1' in dataset_path.lower():
+                from .dataset.ar1 import AR1_ts
+                data_model_name, data_model = 'AR1', AR1_ts(config_path=config_path)
+            elif dataset_path and 'gp' in dataset_path.lower():
+                from .dataset.gp import GP_ts
+                data_model_name, data_model = 'GP', GP_ts(config_path=config_path)
 
-        # Model input shape: (T_0, 1, 1) for LS4/VRNN/LatentODE
+            y_data_input = y_given.squeeze() if y_given.dim() > 1 else y_given # Data model input (T_0,)
+            post_data = data_model.posterior_y(y_data_input, T, N=N_samples)
+            posts[data_model_name.lower().replace('_ts','')] = post_data
+
         y_model_input = y_given.unsqueeze(-1).unsqueeze(1) if y_given.dim() == 1 else y_given.unsqueeze(1) if y_given.dim() == 2 else y_given # Model input (T_0, 1, 1)
-        y_data_input = y_given.squeeze() if y_given.dim() > 1 else y_given # Data model input (T_0,)
+        post_model = model.posterior_y(y_model_input, T, N=N_samples)
+        posts[model_name.lower().replace('_ts','')] = post_model
+    
 
+    # ---------------- 2) make posterior plot ----------------
+    plt.figure(figsize=(12, 6))
+    time_t_0 = np.arange(t_0)
+    time_t_0_to_T = np.arange(t_0, T)
+    time_T = np.arange(T)
+
+    # Conditioning boundary
+    plt.axvline(x=t_0, color='black', linestyle='--', alpha=0.7, linewidth=1.5, label=f'(t={t_0})')
+
+    for name, post in posts.items():
+
+        c = 'r' if name in ['vrnn', 'lode', 'ls4'] else 'g' if name in ['gp', 'ar1'] else 'b'
+
+        # Y'_{:T} | Y_{:t_0}
+        samples = post['x_samples']
+        for i in range(min(10, N_samples)):
+            plt.plot(time_T, samples[i].squeeze(), c, alpha=0.2, linewidth=0.8)
+        if N_samples > 0:   plt.plot([], [], c, alpha=0.2, linewidth=0.8, label=f"$Y'_{{\\leq T}} | Y_{{\\leq T_0}}$ ($N={min(10, N_samples)}$)")
+
+        # E[Y_{:T} | Y_{:t_0}]
+        mean_traj = post['mean_samples'].squeeze()
+        std_traj = post['var_samples'].squeeze()
+
+        plt.plot(time_T, mean_traj, c + '-', linewidth=2, label=f"$\\mathrm{{E}}[Y_{{\\leq T}} | Y_{{\\leq T_0}}]$")
+
+        # Var[Y_{:T} | Y_{:t_0}]
+        plt.fill_between(time_T,
+                        mean_traj - 2*std_traj,
+                        mean_traj + 2*std_traj,
+                        alpha=0.3, color=c, label=f"$\\mathrm{{E}}[Y_{{\\leq T}} | Y_{{\\leq T_0}}] \\pm \\text{{Var}}[Y_{{\\leq T}} | Y_{{\\leq T_0}}]$")
+
+    # Real theta (cyan solid line) - only up to t_0, behind everything
+    if theta_sample is not None:
+        plt.plot(time_t_0, theta_sample[:t_0], 'c-', linewidth=2, label=f'$\\theta_{{\\leq T_0}}$', alpha=0.7, zorder=1)
+
+    # Y data (blue solid line) - only up to t_0, behind everything
+    plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=1.5, label=f'$given Y_{{\\leq T_0}}$', alpha=0.5, zorder=1)
+
+    plt.xlabel('Time')
+    plt.ylabel('Observation')
+    plt.title(f'Posterior plot_{model_name}_{epoch}_{N_samples}samples')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    try:    plt.tight_layout()
+    except Exception:   pass
+    
+    # Save
+    os.makedirs(save_path, exist_ok=True)
+    save_file = os.path.join(save_path, f'posterior_{model_name}_{epoch}_{N_samples}samples.png')
+    plt.savefig(save_file, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+
+
+def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, idx=0, ratio=0.5, N_samples=100):
+
+    posts = {}
+
+    # ---------------- 0) get model, data ----------------
+    if model_name is None:  model_name = model.__class__.__name__
+    if hasattr(model, 'eval'):  model.eval()
+
+    data_file = os.path.join(dataset_path, 'data.pth')
+    data = torch.load(data_file, weights_only=False)
+    Y_test = data['Y_test']
+    theta_test = data.get('theta_test', None)
+    t_test = data.get('t_test', None)
+
+    y_sample = Y_test[idx]
+    theta_sample = theta_test[idx] if theta_test is not None else None
+    t_sample = t_test[idx] if t_test is not None else np.arange(len(y_sample))
+
+    T = len(y_sample)
+    t_0 = int(ratio * T)
+
+    print(f"Sample {idx}: T_data={T}, t_0={t_0}, T={T}, N={N_samples}")
+
+
+    # ---------------- 1) call posterior ----------------
+    with torch.no_grad():
+        device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
+        y_given = torch.tensor(y_sample[:t_0], dtype=torch.float32, device=device)
+
+        if model_name.lower().replace('_ts','') in ['vrnn', 'lode', 'ls4']:
+            # Get data posterior model
+            config_path = os.path.join(dataset_path, 'config.json')
+            if dataset_path and 'ar1' in dataset_path.lower():
+                from .dataset.ar1 import AR1_ts
+                data_model_name, data_model = 'AR1', AR1_ts(config_path=config_path)
+            elif dataset_path and 'gp' in dataset_path.lower():
+                from .dataset.gp import GP_ts
+                data_model_name, data_model = 'GP', GP_ts(config_path=config_path)
+            
+            
+            y_data_input = y_given.squeeze() if y_given.dim() > 1 else y_given # Data model input (T_0,)
+            post_data = data_model.posterior(y_data_input, T, N=N_samples)
+            posts[data_model_name.lower().replace('_ts','')] = post_data
+
+        
+        y_model_input = y_given.unsqueeze(-1).unsqueeze(1) if y_given.dim() == 1 else y_given.unsqueeze(1) if y_given.dim() == 2 else y_given # Model input (T_0, 1, 1)
         post_model = model.posterior(y_model_input, T, N=N_samples)
-        post_data = data_model.posterior(y_data_input, T, N=N_samples)
+        posts[model_name.lower().replace('_ts','')] = post_model
+    
 
 
     # ---------------- 2) make posterior plot ----------------
@@ -149,13 +169,15 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     # Conditioning boundary
     plt.axvline(x=t_0, color='black', linestyle='--', alpha=0.7, linewidth=1.5, label=f'(t={t_0})')
 
-    for c, post in {'r': post_model, 'g': post_data}.items():
+    for name, post in posts.items():
 
+        c = 'r' if name in ['vrnn', 'lode', 'ls4'] else 'g' if name in ['gp', 'ar1'] else 'b'
+        
         # z_{:T} | x_{:t_0}
         samples = post.get('z_samples')
         for i in range(min(10, N_samples)):
             plt.plot(time_T, samples[i].squeeze(), c, alpha=0.2, linewidth=0.8)
-        if N_samples > 0:   plt.plot([], [], c, alpha=0.2, linewidth=0.8, label=f"$\\theta'_{{\\leq T}} | Y_{{\\leq T_0}}$ ($N={min(10, N_samples)}$)")
+        if N_samples > 0:   plt.plot([], [], c, alpha=0.2, linewidth=0.8, label=f"$\\theta_{{\\leq T}} | Y_{{\\leq T_0}}$ ($N={min(10, N_samples)}$)")
 
         # E[z_{:T} | x_{:t_0}]
         mean_traj = post.get('z_mean').squeeze()
@@ -171,10 +193,10 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
 
     # Real theta (cyan solid line) - only up to t_0, behind everything
     if theta_sample is not None:
-        plt.plot(time_t_0, theta_sample[:t_0], 'c-', linewidth=2, label=f'\\theta_{{\\leq T_0}}', alpha=0.7, zorder=1)
+        plt.plot(time_t_0, theta_sample[:t_0], 'c-', linewidth=2, label=f'$\\theta_{{\\leq T_0}}$', alpha=0.7, zorder=1)
 
     # Y data (blue solid line) - only up to t_0, behind everything
-    plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=1.5, label='given Y_{{\\leq T_0}}', alpha=0.5, zorder=1)
+    plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=1.5, label=f'$given Y_{{\\leq T_0}}$', alpha=0.5, zorder=1)
 
     plt.xlabel('Time')
     plt.ylabel('Latent State')
