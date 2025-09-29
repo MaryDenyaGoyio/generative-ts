@@ -152,29 +152,29 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     for c, post in {'r': post_model, 'g': post_data}.items():
 
         # z_{:T} | x_{:t_0}
-        samples = post['z_samples']
+        samples = post.get('z_samples')
         for i in range(min(10, N_samples)):
             plt.plot(time_T, samples[i].squeeze(), c, alpha=0.2, linewidth=0.8)
-        if N_samples > 0:   plt.plot([], [], c, alpha=0.2, linewidth=0.8, label=f"$z'_{{\\leq T}} | Y_{{\\leq T_0}}$ ($N={min(10, N_samples)}$)")
+        if N_samples > 0:   plt.plot([], [], c, alpha=0.2, linewidth=0.8, label=f"$\\theta'_{{\\leq T}} | Y_{{\\leq T_0}}$ ($N={min(10, N_samples)}$)")
 
         # E[z_{:T} | x_{:t_0}]
-        mean_traj = post['z_mean'].squeeze()
-        std_traj = post['z_std'].squeeze()
+        mean_traj = post.get('z_mean').squeeze()
+        std_traj = post.get('z_std').squeeze()
 
-        plt.plot(time_T, mean_traj, c + '-', linewidth=2, label=f"$\\mathrm{{E}}[z_{{\\leq T}} | Y_{{\\leq T_0}}]$")
+        plt.plot(time_T, mean_traj, c + '-', linewidth=2, label=f"$\\mathrm{{E}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}]$")
 
         # Var[z_{:T} | x_{:t_0}]
         plt.fill_between(time_T,
                         mean_traj - 2*std_traj,
                         mean_traj + 2*std_traj,
-                        alpha=0.3, color=c, label=f"$\\mathrm{{E}}[z_{{\\leq T}} | Y_{{\\leq T_0}}] \\pm \\text{{Var}}[z_{{\\leq T}} | Y_{{\\leq T_0}}]$")
+                        alpha=0.3, color=c, label=f"$\\mathrm{{E}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}] \\pm \\text{{Var}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}]$")
 
     # Real theta (cyan solid line) - only up to t_0, behind everything
     if theta_sample is not None:
-        plt.plot(time_t_0, theta_sample[:t_0], 'c-', linewidth=2, label='Real theta', alpha=0.7, zorder=1)
+        plt.plot(time_t_0, theta_sample[:t_0], 'c-', linewidth=2, label=f'\\theta_{{\\leq T_0}}', alpha=0.7, zorder=1)
 
     # Y data (blue solid line) - only up to t_0, behind everything
-    plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=1.5, label='Y data', alpha=0.5, zorder=1)
+    plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=1.5, label='given Y_{{\\leq T_0}}', alpha=0.5, zorder=1)
 
     plt.xlabel('Time')
     plt.ylabel('Latent State')
