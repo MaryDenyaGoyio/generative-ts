@@ -76,10 +76,23 @@ class VRNN_ts(VRNN):
 
 
 
-    def posterior_batch(self, x_given, T, N, verbose=0):
+    def posterior_batch(self, x_given, T, N, mask=None, verbose=0):
 
         device = x_given.device
-        T_0 = x_given.size(0)
+
+        # Parse mask
+        if mask is None:
+            # Original: prefix Y_{:T_0}
+            T_0 = x_given.size(0)
+            M_set = set(range(T_0))
+            obs_dict = {t: x_given[t] for t in range(T_0)}
+        else:
+            # Masked: arbitrary M
+            mask_arr = np.asarray(mask)
+            M_idx = np.where(mask_arr)[0] if mask_arr.dtype == bool else mask_arr
+            M_set = set(M_idx.tolist())
+            obs_dict = {t: x_given[i] for i, t in enumerate(M_idx)}
+            T_0 = None  # not used in masked mode
 
         with torch.no_grad():
             means_batch = torch.zeros(N, T, self.x_dim, device=device)
@@ -95,9 +108,10 @@ class VRNN_ts(VRNN):
 
             for t in range(T):
 
-                # t <= T_0
-                if t < T_0:
-                    x_t = x_given[t] 
+                # Check if t is observed
+                if t in M_set:
+                    # Observed: use encoder q(z_t | x_t, h_{t-1})
+                    x_t = obs_dict[t]
                     if x_t.dim() == 0:  # scalar
                         x_t = x_t.unsqueeze(0).unsqueeze(0).repeat(N, 1)  # (N, 1)
                     elif x_t.dim() == 1:  # (D,)
@@ -106,7 +120,6 @@ class VRNN_ts(VRNN):
                         x_t = x_t.repeat(N, 1)  # (N, D)
                     else:   x_t = x_t.unsqueeze(0).repeat(N, 1)  # fallback
 
-                    # encoder q( z_t | x_t, h_t-1 )
                     phi_x_t = self.phi_x(x_t)
                     enc_t = self.enc(torch.cat([phi_x_t, h_batch[-1]], 1))
                     enc_mean_t = self.enc_mean(enc_t)
@@ -119,10 +132,8 @@ class VRNN_ts(VRNN):
                     x_std = torch.ones_like(x_mean) * torch.exp(self.log_std_y)
                     x_sample = self._reparameterized_sample(x_mean, x_std)
 
-                # T_0 < t <= T
                 else:
-
-                    # prior p( z_t | h_t-1 )
+                    # Missing: use prior p(z_t | h_{t-1})
                     prior_t = self.prior(h_batch[-1])
                     prior_mean_t = self.prior_mean(prior_t)
                     prior_std_t = self.prior_std(prior_t)
@@ -136,6 +147,9 @@ class VRNN_ts(VRNN):
 
                     phi_x_t = self.phi_x(x_sample)
 
+                    enc_mean_t = prior_mean_t  # for storage
+                    enc_std_t = prior_std_t
+
                 # reccurence h_t = f(h_t-1, z_t, x_t)
                 phi_z_t = self.phi_z(z_t)
                 h_combined = torch.cat([phi_x_t, phi_z_t], 1)
@@ -147,8 +161,8 @@ class VRNN_ts(VRNN):
                 stds_batch[:, t] = x_std
 
                 samples_z_batch[:, t] = z_t
-                means_z_batch[:, t] = enc_mean_t if t < T_0 else prior_mean_t
-                stds_z_batch[:, t] = enc_std_t if t < T_0 else prior_std_t
+                means_z_batch[:, t] = enc_mean_t
+                stds_z_batch[:, t] = enc_std_t
 
 
             # Convert to np
@@ -185,8 +199,8 @@ class VRNN_ts(VRNN):
     def posterior_y(self, x_given, T, N, verbose=2):
         return self.posterior_batch(x_given, T, N, verbose)
 
-    def posterior(self, x_given, T, N, verbose=2):
-        return self.posterior_batch(x_given, T, N, verbose)
+    def posterior(self, x_given, T, N, mask=None, verbose=2):
+        return self.posterior_batch(x_given, T, N, mask, verbose)
 
 
     

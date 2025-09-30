@@ -19,6 +19,24 @@ from .eval import plot_posterior, plot_sample
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+def _format_float(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        return format(float(value), 'g')
+    return str(value)
+
+
+def _build_run_name(timestamp: str, model_type: str, model_config: Dict[str, Any]) -> str:
+    parts = [timestamp, model_type.upper()]
+    if model_type.upper() == 'VRNN':
+        std_y = model_config.get('std_Y')
+        if std_y is None:
+            raise KeyError("VRNN 설정에는 config['model']['std_Y']가 필요합니다.")
+        parts.append(f"stdY{_format_float(std_y)}")
+        lmbd = model_config.get('lmbd', 0)
+        if float(lmbd) != 0.0:
+            parts.append(f"lmbd{_format_float(lmbd)}")
+    return "_".join(parts)
+
 
 def load_pretrained_model(model_path, config_path, model_type='LS4'):
     """
@@ -130,10 +148,12 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
     N, T, D = Y_N.shape
     print(f"[Train config]: N_train = {N}, T = {T}, D = {D}")
     
-    loader = DataLoader(TensorDataset(Y_N), 
-                       batch_size=train_config['batch_size'], 
-                       shuffle=True, 
-                       num_workers=4)
+    loader = DataLoader(
+        TensorDataset(Y_N),
+        batch_size=train_config['batch_size'],
+        shuffle=True,
+        num_workers=4
+    )
     
     optimizer = torch.optim.Adam(model.parameters(),
                                 lr=train_config['learning_rate'])
@@ -379,12 +399,12 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
             posterior_save_path = os.path.join(save_path, "post")
             N_samples_plot = 1000 if epoch % 100 == 0 and epoch > 0 else 100
             plot_posterior(model, posterior_save_path, epoch, model_name=model_name,
-                         Y_test=Y_test_eval, theta_test=theta_test_eval, config=config_eval, N_samples=N_samples_plot)
+                         dataset_path=dataset_path, Y_test=Y_test_eval, theta_test=theta_test_eval, config=config_eval, N_samples=N_samples_plot)
 
             # 5-2-3) Loss analysis
             analysis_save_path = os.path.join(save_path, "anl")
             plot_sample(model, analysis_save_path, epoch, model_name=model_name,
-                       Y_test=Y_test_eval, config=config_eval)
+                       dataset_path=dataset_path, Y_test=Y_test_eval, config=config_eval)
             
             elapsed = time.time() - start
             tqdm.write(f"eval: {elapsed:.2f}s")
@@ -519,9 +539,15 @@ def train_model(config: Dict[str, Any]) -> nn.Module:
         os.makedirs(os.path.join(save_path, "anl"), exist_ok=True)
         os.makedirs(os.path.join(save_path, "post"), exist_ok=True)
     else:
-        # New training mode: create new timestamped directory
+        # New training mode: create descriptive timestamped directory
         timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
-        save_path = os.path.join("generative_ts/saves", timestamp)
+        run_name = _build_run_name(timestamp, config['model_type'], config['model'])
+        base_path = os.path.join("generative_ts/saves", run_name)
+        save_path = base_path
+        suffix = 1
+        while os.path.exists(save_path):
+            save_path = f"{base_path}_{suffix}"
+            suffix += 1
         os.makedirs(save_path, exist_ok=True)
         os.makedirs(os.path.join(save_path, "anl"), exist_ok=True)
         os.makedirs(os.path.join(save_path, "post"), exist_ok=True)

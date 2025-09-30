@@ -31,51 +31,69 @@ class GP_ts:
         diff = t1[:, None] - t2[None, :]
         return (self.sigma_f ** 2) * np.exp(-0.5 * diff ** 2 / (self.tau ** 2))
 
-    def posterior(self, Y_given, T, N=20, verbose=0):
+    def posterior(self, Y_given, T, N=20, mask=None, verbose=0):
         '''
-        θ_t | Y_<=t_0 ~ N( μ_t, μ_t )
+        θ_t | Y_M ~ N( μ_t, Σ_t )
 
-        μ_t = m_t + (k_:t + σ_fixed^2 1)^T (K_:: + σ_fixed^2 11^T + σ_y^2 I)^{-1} (Y_<=t_0 - m_<=t_0)
+        General form (handles both prefix Y_1:T_0 and arbitrary mask M):
+        - mask=None → M = {0, 1, ..., T_0-1} (prefix, original behavior)
+        - mask=[...] → M = arbitrary indices
 
-        Σ_t = k_tt + σ_fixed^2 - (k_:t + σ_fixed^2 1)^T (K_:: + σ_fixed^2 11^T + σ_y^2 I)^{-1}(k_:t + σ_fixed^2 1)
+        μ_t = K_(1:T),M (K_M,M + r I)^{-1} y_M
+        Σ_t = K_(1:T),(1:T) - K_(1:T),M (K_M,M + r I)^{-1} K_M,(1:T)
+
+        where K includes fixed variance: K + v 11^T
         '''
+        Y_arr = Y_given.detach().cpu().numpy().reshape(-1) if isinstance(Y_given, torch.Tensor) else np.asarray(Y_given).reshape(-1)
 
-        Y_T_0 = Y_given.detach().cpu().numpy().reshape(-1) if isinstance(Y_given, torch.Tensor) else np.asarray(Y_given).reshape(-1)
-        t_obs = Y_T_0.size
-        time_T_0, time_T = np.arange(t_obs), np.arange(T)
-
-        if time_T_0.size == 0:
-            theta_mean = np.zeros(time_T.size)
-            theta_cov = self._kernel(time_T) + self.v * np.ones((time_T.size, time_T.size))
-        
+        # Parse mask
+        if mask is None:
+            # Original mode: prefix Y_1:T_0
+            M_idx = np.arange(len(Y_arr))
         else:
-            # Cov(Y_<=t_0) = K_:: + σ_fixed^2 11^T + σ_y^2 I
-            Cov_oo = self._kernel(time_T_0) + self.v * np.ones((time_T_0.size,time_T_0.size)) + self.sigma_Y ** 2 * np.eye(time_T_0.size)
-            
-            # Cov(θ_t, Y_<=t_0) = k_:t + σ_fixed^2 1
-            Cov_to = self._kernel(time_T, time_T_0) + self.v * np.ones((time_T.size,time_T_0.size))
+            # Masked mode
+            mask_arr = np.asarray(mask)
+            M_idx = np.where(mask_arr)[0] if mask_arr.dtype == bool else mask_arr
 
-            # Var(θ_t) = k_tt + σ_fixed^2
-            Cov_tt = self._kernel(time_T) + self.v* np.ones((time_T.size,time_T.size))
+        y_M = Y_arr
+        if len(y_M) != len(M_idx):
+            raise ValueError(f"y_obs length {len(y_M)} != mask size {len(M_idx)}")
 
-            # μ_t = m_t + Cov(θ_t, Y_<=t_0)^T Cov(Y_<=t_0)^{-1} (Y_<=t_0 - m)
-            theta_mean = (Cov_to @ self._safe_solve(Cov_oo, Y_T_0.reshape(-1, 1))).reshape(-1)
+        time_T = np.arange(T)
+        time_M = M_idx
 
-            # Σ_t = Var(θ_t) - Cov(θ_t, Y_<=t_0)^T Cov(Y_<=t_0)^{-1} Cov(θ_t, Y_<=t_0)
-            theta_cov = Cov_tt - Cov_to @ self._safe_solve(Cov_oo, Cov_to.T)
+        if len(M_idx) == 0:
+            # Prior only
+            K_TT = self._kernel(time_T) + self.v * np.ones((T, T))
+            theta_mean = np.zeros(T)
+            theta_cov = K_TT
+        else:
+            # K_M,M + r I
+            K_MM = self._kernel(time_M) + self.v * np.ones((len(M_idx), len(M_idx))) + self.sigma_Y ** 2 * np.eye(len(M_idx))
 
-        # θ ~ N(μ, Σ)
+            # K_(1:T),M + v 1
+            K_TM = self._kernel(time_T, time_M) + self.v * np.ones((T, len(M_idx)))
+
+            # K_(1:T),(1:T) + v 11^T
+            K_TT = self._kernel(time_T) + self.v * np.ones((T, T))
+
+            # μ = K_TM (K_MM)^{-1} y_M
+            theta_mean = (K_TM @ self._safe_solve(K_MM, y_M.reshape(-1, 1))).ravel()
+
+            # Σ = K_TT - K_TM K_MM^{-1} K_MT
+            theta_cov = K_TT - K_TM @ self._safe_solve(K_MM, K_TM.T)
+
+        # Sample θ ~ N(μ, Σ)
         theta_samples = np.random.multivariate_normal(theta_mean, theta_cov, N)
 
-        # Y ~ N(θ, σ_Y^2)
+        # Sample y ~ N(θ, σ_Y^2)
         y_samples = np.random.normal(theta_samples, self.sigma_Y, theta_samples.shape)
 
         return {
-            "mean_samples": theta_mean.reshape(-1, 1),
-            "var_samples": np.diag(theta_cov).reshape(-1, 1),
-            "x_samples": y_samples[:, :, None],
-
-            "z_samples": theta_samples,
             "z_mean": theta_mean,
             "z_std": np.sqrt(np.diag(theta_cov)),
+            "z_samples": theta_samples,
+            "x_samples": y_samples[:, :, None],
+            "mean_samples": theta_mean.reshape(-1, 1),
+            "var_samples": np.diag(theta_cov).reshape(-1, 1),
         }

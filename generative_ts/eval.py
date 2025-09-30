@@ -71,10 +71,11 @@ def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None
         device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
         y_given = torch.tensor(y_sample[:t_0], dtype=torch.float32, device=device)
 
-        if model_name.lower().replace('_ts','') in ['vrnn', 'lode', 'ls4']:
+        if model_name.lower().replace('_ts','') in ['vrnn', 'lode', 'ls4'] and dataset_path is not None:
             # Get data posterior model
             dataset_str = str(dataset_path)
-            config_path = Path(dataset_path) / 'config.json'
+            dataset_root = Path(dataset_path)
+            config_path = dataset_root / 'config.json'
             if dataset_path and 'ar1' in dataset_str.lower():
                 from .dataset.ar1 import AR1_ts
                 data_model_name, data_model = 'AR1', AR1_ts(config_path=config_path)
@@ -144,11 +145,14 @@ def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None
 
 
 
-def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, Y_test=None, theta_test=None, t_test=None, config=None, idx=0, ratio=0.5, N_samples=100):
+def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, Y_test=None, theta_test=None, t_test=None, config=None, idx=0, ratio=0.5, mask=None, N_samples=100):
 
     posts = {}
 
     # ---------------- 0) get model, data ----------------
+    if dataset_path is None and Y_test is None:
+        raise ValueError("dataset_path 또는 Y_test가 필요합니다")
+
     if model_name is None:  model_name = model.__class__.__name__
     if hasattr(model, 'eval'):  model.eval()
 
@@ -162,78 +166,142 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     t_sample = t_test[idx] if t_test is not None else np.arange(len(y_sample))
 
     T = len(y_sample)
-    t_0 = int(ratio * T)
 
-    print(f"Sample {idx}: T_data={T}, t_0={t_0}, T={T}, N={N_samples}")
+    # Parse mask (if provided, use masked version)
+    if mask is not None:
+        mask_arr = np.asarray(mask)
+        if mask_arr.dtype == bool:
+            M_idx = np.where(mask_arr)[0]
+        else:
+            M_idx = mask_arr
+        t_0 = None  # masked mode
+    else:
+        t_0 = int(ratio * T)
+        M_idx = None
+
+    print(f"Sample {idx}: T_data={T}, t_0={t_0 if t_0 is not None else f'masked |M|={len(M_idx)}'}, T={T}, N={N_samples}")
 
 
     # ---------------- 1) call posterior ----------------
     with torch.no_grad():
         device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
-        y_given = torch.tensor(y_sample[:t_0], dtype=torch.float32, device=device)
+
+        # Prepare input
+        if M_idx is not None:
+            y_input = y_sample[M_idx]
+            mask_arg = M_idx
+        else:
+            y_input = torch.tensor(y_sample[:t_0], dtype=torch.float32, device=device)
+            mask_arg = None
+
+        # Get data model posterior (GP/AR1)
+        data_model = None
+        data_model_name = None
 
         if model_name.lower().replace('_ts','') in ['vrnn', 'lode', 'ls4']:
-            # Get data posterior model
-            dataset_str = str(dataset_path)
-            config_path = Path(dataset_path) / 'config.json'
+            # Model is VRNN/LODE/LS4, need to load data model from dataset_path
+            dataset_str = str(dataset_path) if dataset_path else ""
+            config_path = Path(dataset_path) / 'config.json' if dataset_path else None
             if dataset_path and 'ar1' in dataset_str.lower():
                 from .dataset.ar1 import AR1_ts
-                data_model_name, data_model = 'AR1', AR1_ts(config_path=config_path)
+                data_model = AR1_ts(config_path=config_path)
+                data_model_name = 'AR1'
             elif dataset_path and 'gp' in dataset_str.lower():
                 from .dataset.gp import GP_ts
-                data_model_name, data_model = 'GP', GP_ts(config_path=config_path)
-            
-            
-            y_data_input = y_given.squeeze() if y_given.dim() > 1 else y_given # Data model input (T_0,)
-            post_data = data_model.posterior(y_data_input, T, N=N_samples)
-            posts[data_model_name.lower().replace('_ts','')] = post_data
+                data_model = GP_ts(config_path=config_path)
+                data_model_name = 'GP'
+        else:
+            # Model is AR1/GP directly
+            data_model = model
+            data_model_name = model_name
 
-        
-        y_model_input = y_given.unsqueeze(-1).unsqueeze(1) if y_given.dim() == 1 else y_given.unsqueeze(1) if y_given.dim() == 2 else y_given # Model input (T_0, 1, 1)
-        post_model = model.posterior(y_model_input, T, N=N_samples)
-        posts[model_name.lower().replace('_ts','')] = post_model
+        # Compute data model posterior if available
+        if data_model is not None:
+            y_data_input = y_input if M_idx is not None else (y_input.squeeze() if y_input.dim() > 1 else y_input)
+            post_data = data_model.posterior(y_data_input, T, N=N_samples, mask=mask_arg)
+            posts[data_model_name.lower()] = post_data
+
+        # Get model posterior (VRNN/LODE/LS4)
+        if model_name.lower().replace('_ts','') in ['vrnn', 'lode', 'ls4']:
+            if M_idx is None:
+                # Original mode: prefix
+                y_model_input = y_input.unsqueeze(-1).unsqueeze(1) if y_input.dim() == 1 else y_input.unsqueeze(1) if y_input.dim() == 2 else y_input
+                post_model = model.posterior(y_model_input, T, N=N_samples)
+                posts[model_name.lower().replace('_ts','')] = post_model
+            else:
+                # Masked mode: VRNN supports mask
+                if model_name.lower().replace('_ts','') == 'vrnn':
+                    y_model_input = torch.tensor(y_input, dtype=torch.float32, device=device) if isinstance(y_input, np.ndarray) else y_input
+                    y_model_input = y_model_input.unsqueeze(-1).unsqueeze(1) if y_model_input.dim() == 1 else y_model_input.unsqueeze(1) if y_model_input.dim() == 2 else y_model_input
+                    post_model = model.posterior(y_model_input, T, N=N_samples, mask=mask_arg)
+                    posts['vrnn'] = post_model
     
 
 
     # ---------------- 2) make posterior plot ----------------
     plt.figure(figsize=(12, 6))
-    time_t_0 = np.arange(t_0)
-    time_t_0_to_T = np.arange(t_0, T)
     time_T = np.arange(T)
 
-    # Conditioning boundary
-    plt.axvline(x=t_0, color='black', linestyle='--', alpha=0.7, linewidth=1.5, label=f'(t={t_0})')
+    if M_idx is not None:
+        # Masked mode: mark observed regions
+        mask_bool = np.zeros(T, dtype=bool)
+        mask_bool[M_idx] = True
+        diff = np.diff(np.concatenate([[0], mask_bool.astype(int), [0]]))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        for start, end in zip(starts, ends):
+            plt.axvspan(start-0.5, end-0.5, alpha=0.25, color='lightgray', zorder=0)
+    else:
+        # Original mode: conditioning boundary
+        time_t_0 = np.arange(t_0)
+        time_t_0_to_T = np.arange(t_0, T)
+        plt.axvline(x=t_0, color='black', linestyle='--', alpha=0.7, linewidth=1.5, label=f'(t={t_0})')
 
     for name, post in posts.items():
 
         c = 'r' if name in ['vrnn', 'lode', 'ls4'] else 'g' if name in ['gp', 'ar1'] else 'b'
-        
+
         # z_{:T} | x_{:t_0}
         samples = post.get('z_samples')
         for i in range(min(10, N_samples)):
             plt.plot(time_T, samples[i].squeeze(), c, alpha=0.2, linewidth=0.8)
-        if N_samples > 0:   plt.plot([], [], c, alpha=0.2, linewidth=0.8, label=f"$\\theta_{{\\leq T}} | Y_{{\\leq T_0}}$ ($N={min(10, N_samples)}$)")
+        if N_samples > 0:
+            label_cond = f"Y_M" if M_idx is not None else f"Y_{{\\leq T_0}}"
+            plt.plot([], [], c, alpha=0.2, linewidth=0.8, label=f"$\\theta_{{1:T}} | {label_cond}$ ($N={min(10, N_samples)}$)")
 
         # E[z_{:T} | x_{:t_0}]
         mean_traj = post.get('z_mean').squeeze()
         std_traj = post.get('z_std').squeeze()
 
-        plt.plot(time_T, mean_traj, c + '-', linewidth=2, label=f"$\\mathrm{{E}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}]$")
+        label_cond = f"Y_M" if M_idx is not None else f"Y_{{\\leq T_0}}"
+        plt.plot(time_T, mean_traj, c + '-', linewidth=2, label=f"{name.upper()}: $\\mathrm{{E}}[\\theta_{{1:T}} | {label_cond}]$")
 
         # Var[z_{:T} | x_{:t_0}]
-        plt.fill_between(
-            time_T,
-            mean_traj - 2 * std_traj,
-            mean_traj + 2 * std_traj,
-            alpha=0.3,
-            color=c,
-            label=f"$\\mathrm{{E}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}] \\pm \\mathrm{{Var}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}]$"
-        )
+        plt.fill_between(time_T, mean_traj - 2 * std_traj, mean_traj + 2 * std_traj,
+                        alpha=0.3, color=c, label=f"{name.upper()}: $\\pm 2\\sigma$")
 
-    if theta_sample is not None:
-        plt.plot(time_t_0, theta_sample[:t_0], 'c-', linewidth=2, label=f'$\\theta_{{\\leq T_0}}$', alpha=0.7, zorder=1)
-
-    plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=1.5, label=f'$given Y_{{\\leq T_0}}$', alpha=0.5, zorder=1)
+    if M_idx is not None:
+        # Masked mode: latent line only on observed indices
+        if theta_sample is not None:
+            theta_arr = theta_sample.squeeze()
+            mask_bool = np.zeros(T, dtype=bool)
+            mask_bool[M_idx] = True
+            diff = np.diff(np.concatenate(([0], mask_bool.astype(int), [0])))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+            for start, end in zip(starts, ends):
+                plt.plot(np.arange(start, end), theta_arr[start:end], c='cyan', linewidth=1.5,
+                         label=f'$\\theta_{{1:T}}$ (true)' if start == starts[0] else None,
+                         alpha=0.7, zorder=1)
+        plt.scatter(M_idx, y_sample[M_idx].squeeze(), c='blue', s=16,
+                    label=f'$Y_M$ (observed)', alpha=0.7, zorder=1)
+    else:
+        # Original mode: latent line up to t_0 only
+        if theta_sample is not None and t_0 is not None and t_0 > 0:
+            plt.plot(np.arange(t_0), theta_sample[:t_0].squeeze(), c='cyan', linewidth=1.5,
+                     label=f'$\\theta_{{\leq T_0}}$ (true)', alpha=0.7, zorder=1)
+        plt.scatter(time_t_0, y_sample[:t_0].squeeze(), c='blue', s=16,
+                    label=f'$Y_{{\\leq T_0}}$ (observed)', alpha=0.7, zorder=1)
 
     plt.xlabel('Time')
     plt.ylabel('Latent State')
@@ -248,7 +316,6 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     save_file = os.path.join(save_path, f'latent_posterior_{model_name}_{epoch}_{N_samples}samples.png')
     plt.savefig(save_file, dpi=150, bbox_inches='tight')
     plt.close()
-
 
 
 
