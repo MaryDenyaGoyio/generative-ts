@@ -4,20 +4,5 @@
     "phi": 0.99,
     "sigma": 0.1,
     "std_Y": 1.0
-  },
-  "n_samples": 10000,
-  "dataset_shape_Y": [
-    10000,
-    300
-  ],
-  "dataset_shape_theta": [
-    10000,
-    300
-  ],
-  "statistics": {
-    "Y_mean": 0.004353144462368586,
-    "Y_std": 1.2262190265818276,
-    "theta_mean": 0.00428829079647193,
-    "theta_std": 0.7099896109628415
   }
 }

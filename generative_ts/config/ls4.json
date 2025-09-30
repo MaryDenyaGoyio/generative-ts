@@ -9,10 +9,6 @@
     "num_sequences": 1000,
     "batch_size": 100,
     "n_epochs": 500,
-    "learning_rate": 0.001,
-    "rollout": {
-      "segments": 10,
-      "alpha": 0
-    }
+    "learning_rate": 0.001
   }
 }

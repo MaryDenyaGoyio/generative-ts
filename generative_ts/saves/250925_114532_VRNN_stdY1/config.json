@@ -6,7 +6,8 @@
     "z_dim": 1,
     "h_dim": 10,
     "n_layers": 1,
-    "lmbd": 0
+    "lmbd": 0,
+    "std_Y": 1
   },
   "train": {
     "num_sequences": 1000,

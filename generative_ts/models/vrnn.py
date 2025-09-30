@@ -15,13 +15,18 @@ from VariationalRecurrentNeuralNetwork.model import VRNN
 
 class VRNN_ts(VRNN):
 
-    def __init__(self, x_dim, z_dim, h_dim, n_layers, lmbd=0, std_Y=0.01, lr_std=False, verbose=0):
+    def __init__(self, x_dim, z_dim, h_dim, n_layers, std_Y, lmbd=0, lr_std=False, verbose=0):
         super().__init__(x_dim=x_dim, h_dim=h_dim, z_dim=z_dim, n_layers=n_layers)
         
         self.lmbd = lmbd
         self.log_std_y = nn.Parameter(torch.log(torch.tensor(std_Y))) if lr_std else torch.log(torch.tensor(std_Y))
         self.verbose, self.device = verbose, DEVICE
     
+
+    def _reparameterized_sample(self, mean, std):
+        eps = torch.empty_like(std).normal_()
+        return eps.mul(std).add_(mean)
+
 
     def forward(self, x):
         all_enc_mean, all_enc_std = [], []

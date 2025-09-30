@@ -1,2 +1,0 @@
-"generative_ts/dataset/ar1_samples_T300_phi0.9_sigma1.0_stdY0.01",
-"generative_ts/dataset/gp_samples_T300_tau10_v10_stdY0.01_sigmaf1_fixed",

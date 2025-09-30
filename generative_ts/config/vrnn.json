@@ -6,16 +6,13 @@
     "z_dim": 1,
     "h_dim": 10,
     "n_layers": 1,
-    "lmbd": 0.1
+    "lmbd": 0,
+    "std_Y": 0.01
   },
   "train": {
     "num_sequences": 1000,
     "batch_size": 100,
     "n_epochs": 500,
-    "learning_rate": 0.001,
-    "rollout": {
-      "segments": 10,
-      "alpha": 1
-    }
+    "learning_rate": 0.001
   }
 }

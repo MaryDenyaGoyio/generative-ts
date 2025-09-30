@@ -62,13 +62,16 @@ def load_pretrained_model(model_path, config_path, model_type='LS4'):
         model_config = config['model']
         
         # Create and load model
+        if 'std_Y' not in model_config:
+            raise KeyError("config['model']['std_Y']가 설정되어야 합니다. VRNN 학습 config를 확인하세요.")
+
         model = VRNN_ts(
-            x_dim=1,
+            x_dim=model_config.get('x_dim', 1),
             z_dim=model_config.get('z_dim', 1),
             h_dim=model_config.get('h_dim', 10),
             n_layers=model_config.get('n_layers', 1),
             lmbd=model_config.get('lmbd', 0),
-            std_Y=config['train'].get('std_Y', 0.01)
+            std_Y=model_config['std_Y']
         ).to(DEVICE)
         
         checkpoint = torch.load(model_path, map_location=DEVICE)
@@ -99,16 +102,16 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
     # ---------------- 1) load data ---------------- 
     print(f"[Load data] {dataset_path}")
 
-    samples_path = os.path.join(dataset_path, "samples.npy")
+    samples_path = os.path.join(dataset_path, "outcome_Y.npy")
     if not os.path.exists(samples_path):    raise FileNotFoundError(f"Not found: {samples_path}")
-    
+
     Y_N_full = np.load(samples_path)
 
     config_path = os.path.join(dataset_path, "config.json")
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             dataset_config = json.load(f)
-        print(f"[Data config]: T = {dataset_config['data']['T']}, N_data = {dataset_config['n_samples']}")
+        print(f"[Data config]: T = {dataset_config['data']['T']}, N_data = {Y_N_full.shape[0]}")
     
     
     # ---------------- 2) train cfg ---------------- 
@@ -143,6 +146,13 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
     x_test = torch.from_numpy(test_data.squeeze(0)).float().to(DEVICE)  # (T, D)
 
     T, T_0 = x_test.shape[0], int(T * T_0_ratio)
+
+    # For eval: prepare data arrays
+    Y_test_eval = Y_N_full  # Full dataset for evaluation
+    theta_test_eval = None
+    if os.path.exists(os.path.join(dataset_path, "latent_theta.npy")):
+        theta_test_eval = np.load(os.path.join(dataset_path, "latent_theta.npy"))
+    config_eval = dataset_config if 'dataset_config' in locals() else None
     
     
     # ---------------- 3) load model ----------------  
@@ -203,16 +213,6 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
                     train_loss = loss_dict['total_loss']
                 else:
                     train_loss = sum(v for v in loss_dict.values() if isinstance(v, torch.Tensor))
-
-                rollout_cfg = train_config.get('rollout') or {}
-                if rollout_cfg:
-                    segs = rollout_cfg.get('segments', 4)
-                    alpha = rollout_cfg.get('alpha', 1.0)
-                    rollout_loss = model.rollout_nll(data, segments=segs)
-                    rollout_term = alpha * rollout_loss
-                    loss_dict['rollout_loss'] = rollout_loss.detach()
-                    loss_dict['rollout_loss_weighted'] = rollout_term.detach()
-                    train_loss = train_loss + rollout_term
             
             # ---------------- 4-2) LS4 ----------------
             # LS4 expects (B, T, D) - data is already in this format
@@ -379,12 +379,12 @@ def train(model, train_config, save_path, model_name, dataset_path, n_eval=10, T
             posterior_save_path = os.path.join(save_path, "post")
             N_samples_plot = 1000 if epoch % 100 == 0 and epoch > 0 else 100
             plot_posterior(model, posterior_save_path, epoch, model_name=model_name,
-                         dataset_path=dataset_path, N_samples=N_samples_plot)
-            
+                         Y_test=Y_test_eval, theta_test=theta_test_eval, config=config_eval, N_samples=N_samples_plot)
+
             # 5-2-3) Loss analysis
             analysis_save_path = os.path.join(save_path, "anl")
-            plot_sample(model, analysis_save_path, epoch, model_name=model_name, 
-                       dataset_path=dataset_path)
+            plot_sample(model, analysis_save_path, epoch, model_name=model_name,
+                       Y_test=Y_test_eval, config=config_eval)
             
             elapsed = time.time() - start
             tqdm.write(f"eval: {elapsed:.2f}s")
@@ -407,6 +407,7 @@ def plot_loss(all_losses, save_path, model_name):
     loss_keys = [k for k, v in all_losses.items() if v and len(v) > 0 and 'loss' in k]
     if not loss_keys:
         return
+
 
     # Define loss order and colors
     loss_order = ['kl_loss', 'kld_loss', 'nll_loss', 'ent_loss', 'rollout_loss_weighted', 'rollout_loss']

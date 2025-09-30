@@ -1,12 +1,49 @@
 import os
+import json
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from pathlib import Path
 from datetime import datetime
 
 
-def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None, idx=0, ratio=0.5, N_samples = 100):
+def _load_dataset(dataset_path=None, Y_test=None, theta_test=None, t_test=None, config=None):
+    if Y_test is None and dataset_path is None:
+        raise ValueError("Either dataset_path or Y_test is required")
+
+    dataset = {}
+    path = Path(dataset_path) if dataset_path else None
+
+    # Load Y_test
+    if Y_test is not None:
+        dataset['Y_test'] = Y_test
+    elif path.is_dir():
+        dataset['Y_test'] = np.load(path / "outcome_Y.npy")
+    else:
+        return torch.load(dataset_path, weights_only=False)
+
+    # Load theta_test
+    if theta_test is not None:
+        dataset['theta_test'] = theta_test
+    elif path and (path / "latent_theta.npy").exists():
+        dataset['theta_test'] = np.load(path / "latent_theta.npy")
+
+    # Load t_test
+    if t_test is not None:
+        dataset['t_test'] = t_test
+
+    # Load config (required)
+    if config is not None:
+        dataset['config'] = config
+    elif path and (path / "config.json").exists():
+        with open(path / "config.json", 'r') as f:
+            dataset['config'] = json.load(f)
+
+    return dataset
+
+
+def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None, Y_test=None, theta_test=None, t_test=None, config=None, idx=0, ratio=0.5, N_samples = 100):
 
     posts = {}
 
@@ -14,8 +51,7 @@ def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None
     if model_name is None:  model_name = model.__class__.__name__
     if hasattr(model, 'eval'):  model.eval()
 
-    data_file = os.path.join(dataset_path, 'data.pth')
-    data = torch.load(data_file, weights_only=False)
+    data = _load_dataset(dataset_path, Y_test, theta_test, t_test, config)
     Y_test = data['Y_test']
     theta_test = data.get('theta_test', None)
     t_test = data.get('t_test', None)
@@ -37,11 +73,12 @@ def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None
 
         if model_name.lower().replace('_ts','') in ['vrnn', 'lode', 'ls4']:
             # Get data posterior model
-            config_path = os.path.join(dataset_path, 'config.json')
-            if dataset_path and 'ar1' in dataset_path.lower():
+            dataset_str = str(dataset_path)
+            config_path = Path(dataset_path) / 'config.json'
+            if dataset_path and 'ar1' in dataset_str.lower():
                 from .dataset.ar1 import AR1_ts
                 data_model_name, data_model = 'AR1', AR1_ts(config_path=config_path)
-            elif dataset_path and 'gp' in dataset_path.lower():
+            elif dataset_path and 'gp' in dataset_str.lower():
                 from .dataset.gp import GP_ts
                 data_model_name, data_model = 'GP', GP_ts(config_path=config_path)
 
@@ -85,11 +122,9 @@ def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None
                         mean_traj + 2*std_traj,
                         alpha=0.3, color=c, label=f"$\\mathrm{{E}}[Y_{{\\leq T}} | Y_{{\\leq T_0}}] \\pm \\text{{Var}}[Y_{{\\leq T}} | Y_{{\\leq T_0}}]$")
 
-    # Real theta (cyan solid line) - only up to t_0, behind everything
     if theta_sample is not None:
         plt.plot(time_t_0, theta_sample[:t_0], 'c-', linewidth=2, label=f'$\\theta_{{\\leq T_0}}$', alpha=0.7, zorder=1)
 
-    # Y data (blue solid line) - only up to t_0, behind everything
     plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=1.5, label=f'$given Y_{{\\leq T_0}}$', alpha=0.5, zorder=1)
 
     plt.xlabel('Time')
@@ -109,7 +144,7 @@ def plot_posterior_y(model, save_path, epoch, model_name=None, dataset_path=None
 
 
 
-def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, idx=0, ratio=0.5, N_samples=100):
+def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, Y_test=None, theta_test=None, t_test=None, config=None, idx=0, ratio=0.5, N_samples=100):
 
     posts = {}
 
@@ -117,8 +152,7 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
     if model_name is None:  model_name = model.__class__.__name__
     if hasattr(model, 'eval'):  model.eval()
 
-    data_file = os.path.join(dataset_path, 'data.pth')
-    data = torch.load(data_file, weights_only=False)
+    data = _load_dataset(dataset_path, Y_test, theta_test, t_test, config)
     Y_test = data['Y_test']
     theta_test = data.get('theta_test', None)
     t_test = data.get('t_test', None)
@@ -140,11 +174,12 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
 
         if model_name.lower().replace('_ts','') in ['vrnn', 'lode', 'ls4']:
             # Get data posterior model
-            config_path = os.path.join(dataset_path, 'config.json')
-            if dataset_path and 'ar1' in dataset_path.lower():
+            dataset_str = str(dataset_path)
+            config_path = Path(dataset_path) / 'config.json'
+            if dataset_path and 'ar1' in dataset_str.lower():
                 from .dataset.ar1 import AR1_ts
                 data_model_name, data_model = 'AR1', AR1_ts(config_path=config_path)
-            elif dataset_path and 'gp' in dataset_path.lower():
+            elif dataset_path and 'gp' in dataset_str.lower():
                 from .dataset.gp import GP_ts
                 data_model_name, data_model = 'GP', GP_ts(config_path=config_path)
             
@@ -186,16 +221,18 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
         plt.plot(time_T, mean_traj, c + '-', linewidth=2, label=f"$\\mathrm{{E}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}]$")
 
         # Var[z_{:T} | x_{:t_0}]
-        plt.fill_between(time_T,
-                        mean_traj - 2*std_traj,
-                        mean_traj + 2*std_traj,
-                        alpha=0.3, color=c, label=f"$\\mathrm{{E}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}] \\pm \\text{{Var}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}]$")
+        plt.fill_between(
+            time_T,
+            mean_traj - 2 * std_traj,
+            mean_traj + 2 * std_traj,
+            alpha=0.3,
+            color=c,
+            label=f"$\\mathrm{{E}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}] \\pm \\mathrm{{Var}}[\\theta_{{\\leq T}} | Y_{{\\leq T_0}}]$"
+        )
 
-    # Real theta (cyan solid line) - only up to t_0, behind everything
     if theta_sample is not None:
         plt.plot(time_t_0, theta_sample[:t_0], 'c-', linewidth=2, label=f'$\\theta_{{\\leq T_0}}$', alpha=0.7, zorder=1)
 
-    # Y data (blue solid line) - only up to t_0, behind everything
     plt.plot(time_t_0, y_sample[:t_0], 'b-', linewidth=1.5, label=f'$given Y_{{\\leq T_0}}$', alpha=0.5, zorder=1)
 
     plt.xlabel('Time')
@@ -215,32 +252,22 @@ def plot_posterior(model, save_path, epoch, model_name=None, dataset_path=None, 
 
 
 
-def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, sample_idx=None):
+def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, Y_test=None, theta_test=None, t_test=None, config=None, sample_idx=None):
     """
     Plot sample diagnostic: θ_t | Y_{≤t} (inference) vs θ_t | θ_{<t} (prior)
     Shows KL divergence and NLL trajectories.
     """
     if hasattr(model, 'eval'):
         model.eval()
-    
+
     # Get model name
     if model_name is None:
         model_name = model.__class__.__name__
-    
+
     # Load test data - create test data if not provided
-    if dataset_path:
-        # Check if dataset_path is a directory (new format) or file (old format)
-        if os.path.isdir(dataset_path):
-            # New format: load from data.pth in the directory
-            data_file = os.path.join(dataset_path, 'data.pth')
-            data = torch.load(data_file, weights_only=False)
-        else:
-            # Old format: load directly
-            data = torch.load(dataset_path, weights_only=False)
-        Y_test = data['Y_test']
-    else:
-        pass
-    
+    data = _load_dataset(dataset_path, Y_test, theta_test, t_test, config)
+    Y_test = data['Y_test']
+
     # Get sigma_Y from dataset config
     if 'config' in data and 'data' in data['config']:
         sigma_Y = data['config']['data'].get('std_Y', 0.01)
@@ -454,8 +481,13 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, sam
             # VRNN or other model - use model's forward pass
 
             try:
-                # Prepare input for VRNN: (T, 1, D)
-                x_input = Y_tensor.unsqueeze(1).unsqueeze(-1)  # (T, 1, 1)
+                # Prepare input for VRNN: (T, B, D)
+                if Y_tensor.dim() == 1:  # (T,)
+                    x_input = Y_tensor.unsqueeze(1).unsqueeze(-1)  # (T, 1, 1)
+                elif Y_tensor.dim() == 2:  # (T, D)
+                    x_input = Y_tensor.unsqueeze(1)  # (T, 1, D)
+                else:
+                    x_input = Y_tensor
 
                 # Use VRNN's forward method
                 post = model.forward(x_input)
@@ -478,8 +510,8 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, sam
                 h = torch.zeros(model.n_layers, 1, model.h_dim, device=device)
                 
                 for t in range(T):
-                    x_t = Y_tensor[t:t+1].unsqueeze(0)  # (1, 1)
-                    phi_x_t = model.phi_x(x_t)
+                    x_t = Y_tensor[t].unsqueeze(0)  # (1, D)
+                    phi_x_t = model.phi_x(x_t)  # (1, phi_x_dim)
                     
                     # Inference q(z_t | x_t, h_{t-1})
                     enc_input = torch.cat([phi_x_t, h[-1]], 1)
@@ -535,19 +567,19 @@ def plot_sample(model, save_path, epoch, model_name=None, dataset_path=None, sam
     ax1.plot(time_steps, Y_test_np, 'bo', markersize=2, label='Data $Y_t$', alpha=0.7)
     
     # Inference (green) - line with std band
-    ax1.plot(time_steps, inference_means, 'g-', linewidth=2, 
+    ax1.plot(time_steps, inference_means.ravel(), 'g-', linewidth=2,
             label=f'LS4 inference $q(\\theta_t | Y_{{\\leq T}})$')
-    ax1.fill_between(time_steps, 
-                     inference_means - inference_stds, 
-                     inference_means + inference_stds, 
+    ax1.fill_between(time_steps,
+                     (inference_means - inference_stds).ravel(),
+                     (inference_means + inference_stds).ravel(),
                      alpha=0.2, color='green')
-    
+
     # Prior (red) - line with std band
-    ax1.plot(time_steps, prior_means, 'r-', linewidth=2,
+    ax1.plot(time_steps, prior_means.ravel(), 'r-', linewidth=2,
             label=f'LS4 prior $p(\\theta_t | \\theta_{{<t}})$')
     ax1.fill_between(time_steps,
-                     prior_means - prior_stds,
-                     prior_means + prior_stds,
+                     (prior_means - prior_stds).ravel(),
+                     (prior_means + prior_stds).ravel(),
                      alpha=0.2, color='red')
     
     ax1.set_ylabel('Value', fontsize=12)
