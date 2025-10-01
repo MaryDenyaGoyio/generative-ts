@@ -52,15 +52,7 @@ def load_model_from_checkpoint(checkpoint_path):
     checkpoint_data = torch.load(model_path, map_location=device, weights_only=False)
 
     if isinstance(checkpoint_data, dict) and 'model_state_dict' in checkpoint_data:
-        # Check model weights in detail before loading
         state_dict = checkpoint_data['model_state_dict']
-        print(f"Model state dict keys: {len(list(state_dict.keys()))} parameters")
-
-        # Check a few key parameters
-        for i, (name, param) in enumerate(list(state_dict.items())[:3]):
-            print(f"  {name}: shape={param.shape}, mean={param.mean().item():.6f}, std={param.std().item():.6f}")
-
-        # Load model weights
         missing_keys, unexpected_keys = model.load_state_dict(checkpoint_data['model_state_dict'], strict=False)
         if missing_keys:
             print(f"Missing keys in checkpoint: {missing_keys}")

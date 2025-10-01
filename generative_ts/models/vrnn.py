@@ -202,8 +202,59 @@ class VRNN_ts(VRNN):
     def posterior(self, x_given, T, N, mask=None, verbose=2):
         return self.posterior_batch(x_given, T, N, mask, verbose)
 
+    def sample_z_t(self, x_obs, target_t, mask=None, n_samples=1):
+        if target_t < 0:
+            raise ValueError(f"target_t={target_t} must be non-negative")
 
-    
+        device = next(self.parameters()).device
+
+        if x_obs is None:
+            x_obs = torch.empty(0, self.x_dim, device=device)
+        else:
+            x_obs = x_obs.to(device)
+            if x_obs.dim() == 1:
+                x_obs = x_obs.unsqueeze(0)
+
+        if mask is None:
+            mask_arr = list(range(x_obs.size(0)))
+        else:
+            mask_arr = list(np.asarray(mask).astype(int))
+
+        obs_dict = {int(t): x_obs[i] for i, t in enumerate(mask_arr)}
+        mask_set = set(mask_arr)
+
+        h = torch.zeros(self.n_layers, n_samples, self.h_dim, device=device)
+
+        for t in range(target_t + 1):
+            if t in mask_set:
+                x_t = obs_dict[t]
+                if x_t.dim() == 0:
+                    x_t = x_t.view(1, 1)
+                elif x_t.dim() == 1:
+                    x_t = x_t.unsqueeze(0)
+                x_rep = x_t.repeat(n_samples, 1)
+                phi_x_t = self.phi_x(x_rep)
+                enc_t = self.enc(torch.cat([phi_x_t, h[-1]], 1))
+                enc_mean_t = self.enc_mean(enc_t)
+                enc_std_t = self.enc_std(enc_t)
+                z_t = self._reparameterized_sample(enc_mean_t, enc_std_t)
+            else:
+                prior_t = self.prior(h[-1])
+                prior_mean_t = self.prior_mean(prior_t)
+                prior_std_t = self.prior_std(prior_t)
+                z_t = self._reparameterized_sample(prior_mean_t, prior_std_t)
+                x_mean = z_t
+                x_std = torch.ones_like(x_mean) * torch.exp(self.log_std_y)
+                x_rep = self._reparameterized_sample(x_mean, x_std)
+                phi_x_t = self.phi_x(x_rep)
+
+            phi_z_t = self.phi_z(z_t)
+            _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1).unsqueeze(0), h)
+
+            if t == target_t:
+                return z_t.detach().cpu()
+
+        raise RuntimeError("Reached end of sequence without sampling target time")
 
     def _entropy_gauss(self, std):
         return 0.5 * torch.log(2 * math.pi * math.e * std.pow(2)).sum()
